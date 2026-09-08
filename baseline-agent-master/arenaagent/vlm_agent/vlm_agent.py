@@ -146,7 +146,7 @@ class VLMAgent(AgentBase):
         image_data = self._to_data_url(b64_image)
         vision_scene_desc = ""
         if self.vision_client and image_data:
-            vision_scene_desc = self._describe_scene(image_data) or ""
+            vision_scene_desc = self._describe_scene(image_data, task_hint=self._vision_task_hint(subject)) or ""
 
         logger.debug("Perception acquired: image size={}, visible objects={}", len(b64_image) if b64_image else 0, visible_objects_info)
 
@@ -1034,7 +1034,30 @@ class VLMAgent(AgentBase):
         logger.info("Vision describer enabled: type={}, model={}", client_type, vcfg.name)
         return ClientFactory().build(client_type, vcfg)
 
-    def _describe_scene(self, image_data: str) -> str:
+    @staticmethod
+    def _vision_task_hint(subject: Any) -> str:
+        if not isinstance(subject, dict):
+            return ""
+        task_type = subject.get("task_type", "")
+        if task_type == "jigsaw":
+            return (
+                "This is a jigsaw task. Focus on: 1) what the reference picture shows; "
+                "2) each empty slot on the puzzle board, its position in the view (left/center/right, "
+                "top/middle/bottom) and the numeric IDs of adjacent placed pieces if readable; "
+                "3) each waiting puzzle piece's numeric ID, color/pattern and position in the view; "
+                "4) which piece most likely fits which empty slot and the needed rotation. "
+                "Ignore unrelated furniture."
+            )
+        if task_type == "tidyroom":
+            return (
+                "This is a room-tidying task. Focus on: which scattered items (pillows/shoes/trash/"
+                "food/cups) should be handled, their numeric IDs and where they are (table/floor/"
+                "sofa/coffee table), and the ID or position of suitable target areas "
+                "(trash bin/cabinet/table top)."
+            )
+        return ""
+
+    def _describe_scene(self, image_data: str, task_hint: str = "") -> str:
         if not self.vision_client:
             return ""
         describe_prompt = (
@@ -1042,6 +1065,8 @@ class VLMAgent(AgentBase):
             "请用中文输出简短场景摘要（150字内）：1) 场景总览；2) 按数字ID列出可见物体及其相对位置（桌上/地面/柜面/手上等）；"
             "3) 值得注意的遮挡、空间关系或异常。只输出摘要，不要JSON。"
         )
+        if task_hint:
+            describe_prompt = describe_prompt + "\n" + task_hint
         content = [
             {"type": "image_url", "image_url": {"url": image_data}},
             {"type": "text", "text": describe_prompt},
