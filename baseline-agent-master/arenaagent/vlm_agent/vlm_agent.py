@@ -32,12 +32,12 @@ class VLMAgentCfg(AgentCfg):
     name: str = "vlm_agent"
     vlm_config: VLMConfig = VLMConfig()
     tongsim_server_endpoint: str = "127.0.0.1:50060"
-    max_history_messages: int = 15
+    max_history_messages: int = 6
 
 
 @Register("vlm_agent")
 class VLMAgent(AgentBase):
-    _MAX_ACTION_HISTORIES = 10
+    _MAX_ACTION_HISTORIES = 8
     _NPC_PINYIN_ALIASES: dict[str, str] = {
         "jiangshuyan": "江淑艳",
         "liuweidong": "刘伟东",
