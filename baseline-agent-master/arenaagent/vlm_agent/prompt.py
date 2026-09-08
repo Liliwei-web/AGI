@@ -81,6 +81,7 @@ class PromptGenerator:
         image: str | None = None,
         context_messages: list[dict[str, Any]] | None = None,
         last_json_parse_message: str = "",
+        vision_desc: str = "",
         include_instructions: bool = True,
     ) -> list[dict[str, Any]]:
         context_messages = list(context_messages or [])
@@ -98,6 +99,8 @@ class PromptGenerator:
         interaction_text = self._render_template(assets.interactions, render_ctx)
 
         interaction_text = self._append_hand_status(interaction_text, variables or {})
+        if vision_desc:
+            interaction_text = f"{interaction_text}\n\n【视觉场景描述】（由视觉模型生成）：\n{vision_desc}"
         if last_json_parse_message:
             interaction_text = f"{interaction_text}\n{last_json_parse_message}"
 

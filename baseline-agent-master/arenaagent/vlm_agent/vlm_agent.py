@@ -24,7 +24,7 @@ from arenaagent.vlm_agent.raven_skill import (
     materialize_task_data_images,
 )
 from arenaagent.vlm_agent.raven_skill import handle as handle_raven_skill
-from arenaagent.vlm_agent.vlm_config import VLMConfig
+from arenaagent.vlm_agent.vlm_config import VLMClientCfg, VLMConfig
 
 
 @configclass
@@ -81,6 +81,8 @@ class VLMAgent(AgentBase):
         self._raven_candidates_cache: dict[str, list[list[int]]] = {}
         self._raven_next_index: dict[str, int] = {}
         self._raven_image_temp_path: str = ""
+        self.vision_client: Any | None = None
+        self._vision_scene_desc: str = ""
 
     def init(self, opt: dict[str, Any]) -> None:
         if self._initialized:
@@ -89,6 +91,7 @@ class VLMAgent(AgentBase):
         self.cfg.vlm_config.apply_env_overrides()
         logger.debug("client config {}", self.cfg.vlm_config.client_cfg)
         self.vlm_client = ClientFactory().build(self.cfg.vlm_config.client_type, self.cfg.vlm_config.client_cfg)
+        self.vision_client = self._build_vision_client_if_enabled()
 
         tongsim_server_endpoint = opt.get("tongsim_server_endpoint") or self.cfg.tongsim_server_endpoint
         self.tongsim = TongSimGrpcClient(endpoint=tongsim_server_endpoint)
@@ -141,6 +144,9 @@ class VLMAgent(AgentBase):
         visible_objects_info = perception.get("objects", [])
         self._last_visible_objects_info = visible_objects_info or []
         image_data = self._to_data_url(b64_image)
+        vision_scene_desc = ""
+        if self.vision_client and image_data:
+            vision_scene_desc = self._describe_scene(image_data) or ""
 
         logger.debug("Perception acquired: image size={}, visible objects={}", len(b64_image) if b64_image else 0, visible_objects_info)
 
@@ -179,7 +185,8 @@ class VLMAgent(AgentBase):
         messages = (
             self.prompt_generator.Generate(  # type: ignore[union-attr]
                 variables=prompt_variables,
-                image=image_data,
+                image=(None if self.vision_client else image_data),
+                vision_desc=vision_scene_desc,
                 context_messages=self._trim_history_messages(),
                 last_json_parse_message=self.last_json_parse_message
                 if isinstance(self.last_json_parse_message, str)
@@ -194,6 +201,9 @@ class VLMAgent(AgentBase):
         self._save_prompt_messages(messages)
 
         self._after_prompt_hook(subject)
+
+        if self.vision_client:
+            self._strip_user_image_blocks(messages)
 
         # 5: 调用大模型
         response = self.vlm_client.invoke(messages) if self.vlm_client else None
@@ -403,11 +413,9 @@ class VLMAgent(AgentBase):
     def _to_data_url(image_b64: str | None) -> str | None:
         if not image_b64:
             return None
-        prefix = "data:image/jpeg;base64,"
         if image_b64.startswith("data:image"):
             return image_b64
-        return f"{prefix}{image_b64}"
-
+        return f"[image omitted]{image_b64}"
     def _parse_action_from_response(self, resp):
         """
         按 react.txt 约定的格式解析模型回复：
@@ -1012,6 +1020,50 @@ class VLMAgent(AgentBase):
             message = "你好！告诉我点什么吧"
 
         return str(message).strip()
+
+    def _build_vision_client_if_enabled(self) -> Any | None:
+        client_type = os.environ.get("VLM_VISION_CLIENT_TYPE", "").strip()
+        if not client_type:
+            return None
+        vcfg = VLMClientCfg()
+        vcfg.name = os.environ.get("VLM_VISION_CLIENT_CFG_NAME", vcfg.name)
+        vcfg.api_base = os.environ.get("VLM_VISION_CLIENT_CFG_API_BASE", vcfg.api_base)
+        vcfg.api_key = os.environ.get("VLM_VISION_CLIENT_CFG_API_KEY", vcfg.api_key)
+        vcfg.api_version = os.environ.get("VLM_VISION_CLIENT_CFG_API_VERSION", vcfg.api_version)
+        logger.info("Vision describer enabled: type={}, model={}", client_type, vcfg.name)
+        return ClientFactory().build(client_type, vcfg)
+
+    def _describe_scene(self, image_data: str) -> str:
+        if not self.vision_client:
+            return ""
+        describe_prompt = (
+            "仔细观察这张第一视角组合图：左半是角色第一视角RGB画面，右半是带数字ID标注的语义分割图（数字即物体ID）。"
+            "请用中文输出简短场景摘要（150字内）：1) 场景总览；2) 按数字ID列出可见物体及其相对位置（桌上/地面/柜面/手上等）；"
+            "3) 值得注意的遮挡、空间关系或异常。只输出摘要，不要JSON。"
+        )
+        content = [
+            {"type": "image_url", "image_url": {"url": image_data}},
+            {"type": "text", "text": describe_prompt},
+        ]
+        try:
+            resp = self.vision_client.invoke([{"role": "user", "content": content}])
+            text = getattr(resp, "text", None) or ""
+            logger.debug("Vision describer output length={}", len(text))
+            return text.strip()
+        except Exception as exc:
+            logger.warning("视觉描述器调用失败，本轮跳过: {}", exc)
+            return ""
+
+    def _strip_user_image_blocks(self, messages: list[dict[str, Any]]) -> None:
+        if not messages:
+            return
+        last = messages[-1]
+        content = last.get("content")
+        if isinstance(content, list):
+            last["content"] = [
+                block for block in content
+                if not (isinstance(block, dict) and block.get("type") == "image_url")
+            ]
 
     def _load_api_info(self) -> Any:
         try:
