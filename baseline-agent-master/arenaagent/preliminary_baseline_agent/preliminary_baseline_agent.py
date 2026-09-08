@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import json
 from typing import Any
 
 from loguru import logger
@@ -57,22 +56,6 @@ class PreliminaryBaselineAgent(VLMAgent):
 
         self._task_spec_prompt_cache[task_type] = text
         return text
-
-        try:
-            here = os.path.dirname(os.path.abspath(__file__))
-            task_spec_prompt_path = os.path.join(here, "prompts", "task_spec_prompt.json")
-            with open(task_spec_prompt_path, "r", encoding="utf-8") as handle:
-                loaded = json.load(handle)
-            if isinstance(loaded, dict):
-                self._task_spec_prompt_cache = {str(key): str(value) for key, value in loaded.items()}
-            else:
-                self._task_spec_prompt_cache = {}
-        except Exception as exc:
-            logger.warning(f"加载 task_spec_prompt.json 失败: {exc}")
-            self._task_spec_prompt_cache = {}
-
-        return self._task_spec_prompt_cache
-
     def _build_prompt_variables(
         self,
         subject: Any,
