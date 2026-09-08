@@ -1,0 +1,1 @@
+speak_to_npc的参数只能是"江淑艳(jiangshuyan)、刘伟东(liuweidong)、赵爷爷(zhaoyeye)和张奶奶(zhangnainai)"
