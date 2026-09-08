@@ -78,6 +78,7 @@ class VLMAgent(AgentBase):
         self._task_spec_prompt_cache: dict[str, str] | None = None
         self._movable_objects: list[Any] = []
         self._action_histories: list[dict[str, Any]] = []
+        self._attempted_action_keys: list[str] = []
         self._raven_candidates_cache: dict[str, list[list[int]]] = {}
         self._raven_next_index: dict[str, int] = {}
         self._raven_image_temp_path: str = ""
@@ -223,9 +224,19 @@ class VLMAgent(AgentBase):
         logger.info("vlm client response {} and parsed json message {}", str(response.text), str(json_parsed_message))
         # 6: 解析回复
         parsed_action = self._parse_action_from_response(json_parsed_message)
+        repeat_blocked = False
+        if parsed_action:
+            repeat_blocked = self._check_and_record_action(parsed_action)
 
         # 7: 执行动作
-        action_res = self._do_action(parsed_action)
+        if repeat_blocked:
+            action_res = {
+                "result": "failed",
+                "error": "重复动作拦截：该动作及参数与最近两次完全相同，属于无效循环。请改变动作或参数（例如换目标ID、换旋转角度、换槽位/位置），不要再重复相同指令。",
+            }
+            logger.info("Repeat guard applied, identical action skipped.")
+        else:
+            action_res = self._do_action(parsed_action)
         self._last_action_res = action_res if action_res is not None else {}
 
         # 8: 记录动作历史
@@ -294,6 +305,25 @@ class VLMAgent(AgentBase):
             self._MAX_ACTION_HISTORIES,
         )
         return self._action_histories
+
+    def _action_identity(self, parsed_action: dict[str, Any]) -> str:
+        selected = {key: parsed_action.get(key) for key in ("action", "parameters")}
+        return json.dumps(selected, ensure_ascii=False, sort_keys=True, default=str)
+
+    def _check_and_record_action(self, parsed_action: dict[str, Any]) -> bool:
+        """Return True when the same action+parameters repeats for a 3rd consecutive time."""
+        key = self._action_identity(parsed_action)
+        blocked = (
+            len(self._attempted_action_keys) >= 2
+            and self._attempted_action_keys[-1] == key
+            and self._attempted_action_keys[-2] == key
+        )
+        self._attempted_action_keys.append(key)
+        if len(self._attempted_action_keys) > 40:
+            self._attempted_action_keys = self._attempted_action_keys[-40:]
+        if blocked:
+            logger.warning("Repeat guard blocked identical action+parameters: {}", key[:200])
+        return blocked
 
     def _before_prompt_hook(self, subject):
         if isinstance(subject, dict):
