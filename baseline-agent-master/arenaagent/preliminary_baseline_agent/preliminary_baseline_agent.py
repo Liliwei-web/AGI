@@ -36,9 +36,27 @@ class PreliminaryBaselineAgent(VLMAgent):
         return False
 
 
-    def _load_task_spec_prompts(self) -> dict[str, str]:
-        if self._task_spec_prompt_cache is not None:
-            return self._task_spec_prompt_cache
+    def _load_task_spec_prompt(self, task_type: str) -> str:
+        if self._task_spec_prompt_cache is None:
+            self._task_spec_prompt_cache = {}
+
+        if task_type in self._task_spec_prompt_cache:
+            return self._task_spec_prompt_cache[task_type]
+
+        text = ""
+        if task_type:
+            here = os.path.dirname(os.path.abspath(__file__))
+            task_prompt_path = os.path.join(here, "prompts", "tasks", task_type, "task_spec.txt")
+            try:
+                with open(task_prompt_path, "r", encoding="utf-8") as handle:
+                    text = handle.read().strip()
+            except FileNotFoundError:
+                logger.warning(f"任务专属 prompt 文件不存在: {task_prompt_path}")
+            except Exception as exc:
+                logger.warning(f"加载任务专属 prompt 失败: {exc}")
+
+        self._task_spec_prompt_cache[task_type] = text
+        return text
 
         try:
             here = os.path.dirname(os.path.abspath(__file__))
@@ -64,7 +82,7 @@ class PreliminaryBaselineAgent(VLMAgent):
         object_in_hand: Any,
     ) -> dict[str, Any]:
         task_type = subject.get("task_type", "") if isinstance(subject, dict) else ""
-        task_prompt = self._load_task_spec_prompts().get(task_type, "") if task_type else ""
+        task_prompt = self._load_task_spec_prompt(task_type) if task_type else ""
 
         if task_type == "jigsaw" and isinstance(subject, dict):
             reference_bounding = subject.get("reference_bounding", [])
