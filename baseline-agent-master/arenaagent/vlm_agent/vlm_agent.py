@@ -416,6 +416,7 @@ class VLMAgent(AgentBase):
         if image_b64.startswith("data:image"):
             return image_b64
         return "data:image/jpeg;base64," + image_b64
+
     def _parse_action_from_response(self, resp):
         """
         按 react.txt 约定的格式解析模型回复：
