@@ -341,7 +341,7 @@ Prompt 生成代码在：
 - `react.txt`：告诉模型你是谁、能干什么、要按什么格式输出。
 - `interaction_info.txt`：把当前任务、能看到的物体、上一步结果摆给模型。
 - `instructions*.txt`：策略补充，比如跟 NPC 对话时怎么问、做任务阶段怎么干。
-- `task_spec_prompt.json` / `stage_spec_prompts.json`：针对某一类任务的专门提示。
+- 初赛为 `prompts/tasks/<task_type>/task_spec.txt`（决赛为 `stage_spec_prompts.json`）：针对某一类任务的专门提示。
 - `api.json` / `api_info.json`：动作接口的说明。
 
 真正发到模型那边的内容，每一轮大概是这么拼起来的：
@@ -396,10 +396,10 @@ Prompt 生成代码在：
 初赛任务在：
 
 ```text
-arenaagent/preliminary_baseline_agent/prompts/task_spec_prompt.json
+arenaagent/preliminary_baseline_agent/prompts/tasks/<task_type>/task_spec.txt
 ```
 
-`task_spec_prompt.json` 用在初赛 baseline，匹配字段是任务类型的关键字。当前支持的 key：
+初赛 baseline 按 `subject["task_type"]` 自动加载 `tasks/<task_type>/task_spec.txt`，每个任务一个独立 prompt 目录。当前支持的 key：
 
 | key | 任务类型 |
 | --- | --- |
