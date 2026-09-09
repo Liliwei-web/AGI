@@ -106,6 +106,7 @@ class JigsawProbeAgent(AgentBase):
                     pass
         self._gd: dict[str, Any] = {}
         self._poster_scan = os.environ.get("JIGSAW_POSTER", "").strip().lower() in ("1", "true", "yes")
+        self._pframe = os.environ.get("JIGSAW_PFRAME", "").strip().lower() in ("1", "true", "yes")
 
 
     # ------------------------------------------------------------------ #
@@ -206,6 +207,10 @@ class JigsawProbeAgent(AgentBase):
             self._setup_poster_scan()
             self._state = "poster2"
             return self._ok("poster scan start")
+        if self._pframe:
+            self._setup_pframe()
+            self._state = "pframe"
+            return self._ok("pframe start")
 
         if self._scan_only:
             # 侦察模式：只在原图分辨率下抓若干视角，不做任何取放
@@ -1295,6 +1300,74 @@ class JigsawProbeAgent(AgentBase):
         self._record({"kind": "poster_cell_sample", "r": int(r), "c": int(c), "y": float(y), "z": float(z), "stats": stats})
         g["i"] += 1
         return self._ok("poster cell {}.{}".format(int(r), int(c)))
+
+    def _setup_pframe(self) -> None:
+        posters = self._find_posters()
+        picked = None
+        for cand in posters:
+            if picked is None or cand["area"] > picked["area"]:
+                picked = cand
+        center = None
+        if picked is not None:
+            center = {
+                "X": 837.0,
+                "Y": (float(picked["y0"]) + float(picked["y1"])) / 2.0,
+                "Z": (float(picked["z0"]) + float(picked["z1"])) / 2.0,
+            }
+        self._record({"kind": "pframe_plan", "picked": picked, "poster_center": center})
+        stands = [
+            {"X": 760.0, "Y": 105.0, "Z": 87.0},
+            {"X": 797.0, "Y": 105.0, "Z": 87.0},
+            {"X": 797.0, "Y": 105.0, "Z": 60.0},
+            {"X": 797.0, "Y": 166.0, "Z": 60.0},
+        ]
+        self._gd = {"stage": "move", "stand": None, "target": center, "stands": stands, "sidx": 0}
+
+    def _phase_pframe(self) -> dict[str, Any]:
+        g = self._gd
+        stands = g["stands"]
+        if g["sidx"] >= len(stands):
+            return self._finish_now("pframe done")
+        if g["stage"] == "move":
+            stand = stands[g["sidx"]]
+            res = {}
+            try:
+                res = self._tongsim.move_to_location(self._character_id, stand, stop_distance=1.0)
+            except Exception as exc:
+                res = {"result": "failed", "error": str(exc)}
+            if not self._result_ok(res):
+                g["sidx"] += 1
+                return self._ok("pframe stand fail, next")
+            g["stand"] = stand
+            g["stage"] = "aim"
+            self._record({"kind": "pframe_stand", "stand": g["stand"]})
+            return self._ok("pframe stand done")
+        if g["stage"] == "aim":
+            target = g["target"] or {"X": 837.0, "Y": 105.0, "Z": 87.0}
+            try:
+                self._tongsim.look_at_location(self._character_id, target)
+            except Exception as exc:
+                logger.warning("pframe look failed: {}", exc)
+            time.sleep(1.2)
+            perception = self._tongsim.acquire_first_person_perception(self._character_id) or {}
+            image_b64 = perception.get("image") or ""
+            out: dict[str, Any] = {"stand": g["stand"], "target": target}
+            if image_b64:
+                out["image_path"] = self._save_image(image_b64, "pframe_poster_center")
+                payload = image_b64.split(",", 1)[1] if image_b64.startswith("data:image") else image_b64
+                try:
+                    import io as io_lib
+                    from PIL import Image as PILImage
+                    im = PILImage.open(io_lib.BytesIO(base64.b64decode(payload, validate=True)))
+                    out["image_size"] = list(im.size)
+                except Exception as exc:
+                    out["size_error"] = str(exc)
+            out["objects_visible"] = len((perception.get("objects") or []))
+            self._record({"kind": "pframe_capture", "info": out})
+            g["sidx"] += 1
+            g["stage"] = "move"
+            return self._ok("pframe capture done")
+        return self._finish_now("pframe unknown")
 
     def _lookback(self, tag: str, target: list[float] | None = None) -> dict[str, Any]:
         """回到出生观察点面向板面，全量抓一帧，确认块是否锁定/弹回。"""
