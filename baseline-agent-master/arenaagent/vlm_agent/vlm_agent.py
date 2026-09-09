@@ -84,6 +84,11 @@ class VLMAgent(AgentBase):
         self._raven_image_temp_path: str = ""
         self.vision_client: Any | None = None
         self._vision_scene_desc: str = ""
+        self._recon_enabled = os.environ.get("ARENA_RECON", "").strip().lower() in ("1", "true", "yes")
+        self._recon_path: str | None = None
+        self._recon_last_subject: str | None = None
+        self._recon_pending_puts: list[dict[str, Any]] = []
+        self._recon_step = 0
 
     def init(self, opt: dict[str, Any]) -> None:
         if self._initialized:
@@ -144,6 +149,7 @@ class VLMAgent(AgentBase):
         self._save_perception_image(b64_image)
         visible_objects_info = perception.get("objects", [])
         self._last_visible_objects_info = visible_objects_info or []
+        self._recon_frame(visible_objects_info, subject)
         image_data = self._to_data_url(b64_image)
         vision_scene_desc = ""
         if self.vision_client and image_data:
@@ -238,6 +244,32 @@ class VLMAgent(AgentBase):
         else:
             action_res = self._do_action(parsed_action)
         self._last_action_res = action_res if action_res is not None else {}
+        if self._recon_enabled and parsed_action:
+            action_name = parsed_action.get("action", "")
+            action_params = parsed_action.get("parameters") or {}
+            self._recon_log(
+                {
+                    "kind": "action",
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "step": self._recon_step,
+                    "action": action_name,
+                    "parameters": action_params,
+                    "result": self._last_action_res,
+                }
+            )
+            if action_name in ("put_down_sth", "move_and_put_down"):
+                target = action_params.get("target_location")
+                if target is None and action_name == "move_and_put_down":
+                    target = action_params.get("put_target_location")
+                if target is not None:
+                    self._recon_pending_puts.append(
+                        {
+                            "ts": datetime.now().isoformat(timespec="seconds"),
+                            "action": action_name,
+                            "target": target,
+                        }
+                    )
+            self._recon_step += 1
 
         # 8: 记录动作历史
         if parsed_action:
@@ -1120,6 +1152,112 @@ class VLMAgent(AgentBase):
                 block for block in content
                 if not (isinstance(block, dict) and block.get("type") == "image_url")
             ]
+
+    def _recon_log(self, record: dict[str, Any]) -> None:
+        if not self._recon_enabled:
+            return
+        try:
+            if self._recon_path is None:
+                log_dir = os.path.join(getattr(self.cfg, "log_dir", "") or "logs", "recon")
+                os.makedirs(log_dir, exist_ok=True)
+                self._recon_path = os.path.join(log_dir, "recon_{}.jsonl".format(getattr(self, "agent_id", "agent")))
+            with open(self._recon_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        except Exception as exc:  # pragma: no cover - recon log guard
+            logger.warning("Recon log write failed: {}", exc)
+
+    @staticmethod
+    def _recon_vector3(value: Any) -> list[float] | None:
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            x = value.get("x", value.get("X"))
+            y = value.get("y", value.get("Y"))
+            z = value.get("z", value.get("Z"))
+        elif isinstance(value, (list, tuple)) and len(value) >= 3:
+            x, y, z = value[0], value[1], value[2]
+        else:
+            return None
+        try:
+            return [float(x), float(y), float(z)]
+        except (TypeError, ValueError):
+            return None
+
+    def _recon_dist(self, a: Any, b: Any) -> float | None:
+        va = self._recon_vector3(a)
+        vb = self._recon_vector3(b)
+        if va is None or vb is None:
+            return None
+        return round(((va[0] - vb[0]) ** 2 + (va[1] - vb[1]) ** 2 + (va[2] - vb[2]) ** 2) ** 0.5, 2)
+
+    def _recon_frame(self, visible_objects_info: Any, subject: Any) -> None:
+        if not self._recon_enabled:
+            return
+        try:
+            if isinstance(subject, dict):
+                subject_key = json.dumps(subject, ensure_ascii=False, sort_keys=True, default=str)
+            else:
+                subject_key = str(subject)
+        except Exception:
+            subject_key = str(subject)
+        if subject_key != self._recon_last_subject:
+            self._recon_last_subject = subject_key
+            self._recon_log(
+                {
+                    "kind": "subject",
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "step": self._recon_step,
+                    "subject": subject,
+                }
+            )
+        objects = []
+        for obj in visible_objects_info or []:
+            if not isinstance(obj, dict):
+                continue
+            objects.append(
+                {
+                    "object_id": obj.get("object_id"),
+                    "place_location": obj.get("place_location"),
+                    "rotation": obj.get("rotation"),
+                    "color": obj.get("color"),
+                    "shape": obj.get("shape"),
+                }
+            )
+        self._recon_log(
+            {
+                "kind": "frame",
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "step": self._recon_step,
+                "objects": objects,
+            }
+        )
+        if self._recon_pending_puts:
+            pendings = self._recon_pending_puts
+            self._recon_pending_puts = []
+            for pending in pendings:
+                target = pending.get("target")
+                near = []
+                for obj in objects:
+                    dist = self._recon_dist(obj.get("place_location"), target)
+                    if dist is not None and dist <= 80:
+                        near.append(
+                            {
+                                "object_id": obj.get("object_id"),
+                                "place_location": obj.get("place_location"),
+                                "rotation": obj.get("rotation"),
+                                "dist": dist,
+                            }
+                        )
+                near.sort(key=lambda item: item["dist"])
+                self._recon_log(
+                    {
+                        "kind": "put_next_frame",
+                        "put_ts": pending.get("ts"),
+                        "action": pending.get("action"),
+                        "target": target,
+                        "nearest": near[:6],
+                    }
+                )
 
     def _load_api_info(self) -> Any:
         try:
