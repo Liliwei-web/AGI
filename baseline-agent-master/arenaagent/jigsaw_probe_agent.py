@@ -477,7 +477,15 @@ class JigsawProbeAgent(AgentBase):
                 continue
             y = float(seg[0])
             z = float(seg[1])
-            yaw = float(seg[2]) if len(seg) > 2 else None
+            yaw = None
+            if len(seg) > 2 and seg[2] not in ('', 'auto'):
+                tok = seg[2]
+                if tok.startswith('+'):
+                    yaw = (self._target_yaw or 0.0) + float(tok[1:])
+                elif tok.startswith('-'):
+                    yaw = (self._target_yaw or 0.0) + float(tok)
+                else:
+                    yaw = float(tok)
             out.append((str(pid).strip(), y, z, yaw))
         return out
 
