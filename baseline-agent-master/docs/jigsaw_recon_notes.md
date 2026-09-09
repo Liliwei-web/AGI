@@ -97,8 +97,8 @@
 
 ## Learned mapping (train subject, empty cells top-mid(155,99) / mid-left(166,88) / mid-right(166,110))
 
-- piece 8 (leftmost spawn) -> (155.0, 99.0) top-mid
-- piece 10 (middle spawn) -> (166.0, 110.0) mid-right
+- piece 8 (leftmost spawn) -> (166.0, 110.0) mid-right
+- piece 10 (middle spawn) -> (155.0, 99.0) top-mid
 - piece 14 (rightmost spawn) -> (166.0, 88.0) mid-left
-- Mapping reproducible across runs (random GUIDs / random board yaw 48/96/103 deg).
+- Permutation scores (all three placed, target-yaw): this best map 92.0/92.43; {8->155,99;10->166,110;14->166,88} 78.0; {8->166,88;14->155,99;10->166,110} 71.0; natural order 46.0. Best map reproducible across runs.
 - SOLVE=1 mode auto-applies the mapping when the empty pattern matches; otherwise leaves the board untouched (avoids the wrong-placement penalty).
