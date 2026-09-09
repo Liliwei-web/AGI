@@ -1,0 +1,526 @@
+from __future__ import annotations
+
+import base64
+import json
+import os
+import time
+from datetime import datetime
+from typing import Any
+
+from loguru import logger
+
+from arenaagent.agent_base import AgentBase, AgentCfg
+from arenaagent.builder import Register
+from arenaagent.tongsim_grpc_client import TongSimGrpcClient
+from arenaagent.tongsim_interface import Rotation
+from arenaagent.utils.configclass import configclass
+
+
+@configclass
+class JigsawProbeAgentCfg(AgentCfg):
+    name: str = "jigsaw_probe_agent"
+    sleep_between_steps: float = 1.0
+    log_dir: str = "logs"
+    tongsim_server_endpoint: str = "127.0.0.1:50060"
+
+
+@Register("jigsaw_probe_agent")
+class JigsawProbeAgent(AgentBase):
+    """脚本化协议探测 agent：不做 LLM 决策，按固定 FSM 依次执行动作并全量落盘。
+
+    目标回答四个协议问题：
+      Q1 put 后从观察点回看，块是否锁定在槽内、最终 yaw 是多少；
+      Q2 已放入槽的块能否 move_and_take_object 取回（局内纠错能力）；
+      Q3 auto_rotate=True 时服务端是否自动转正到板面 yaw；
+      Q4 待放块出生 yaw 与最终放置 yaw 的对应关系。
+    """
+
+    _BOARD_X_TOL = 2.0
+    _YAW_81_TOL = 5.0
+
+    def __init__(self, stub, channel, cfg=None, sleep_between_steps: float = 1.0) -> None:
+        super().__init__(
+            stub=stub,
+            channel=channel,
+            cfg=cfg or JigsawProbeAgentCfg(),
+            sleep_between_steps=sleep_between_steps,
+        )
+        self._initialized = False
+        self._tongsim: TongSimGrpcClient | None = None
+        self._character_id: str | None = None
+        self._spawn_loc: list[float] = []
+        self._state = "start"
+        self._step_no = 0
+        self._record_path: str | None = None
+        # 探测运行期状态
+        self._subject: dict[str, Any] = {}
+        self._movables: list[str] = []  # 待放块 object_id（按出生位置排序）
+        self._placed: dict[str, list[float]] = {}  # block_id -> slot [y,z]
+        self._occupied_slots: list[list[float]] = []  # 已被占用的空槽 [y,z]
+        self._empty_slots: list[list[float]] = []  # 初始空槽 [y,z]
+        self._in_hand: str | None = None
+        self._undo_res: dict[str, Any] = {}
+        self._need_auto_piece = False
+        self._finish_done = False
+
+    # ------------------------------------------------------------------ #
+    # 生命周期
+    # ------------------------------------------------------------------ #
+
+    def init(self, opt: dict[str, Any]) -> None:
+        if self._initialized:
+            return
+        log_dir = os.path.join(getattr(self.cfg, "log_dir", "") or "logs", "recon")
+        os.makedirs(log_dir, exist_ok=True)
+        self._record_path = os.path.join(log_dir, "probe_{}.jsonl".format(self.agent_id))
+
+        endpoint = opt.get("tongsim_server_endpoint") or self.cfg.tongsim_server_endpoint
+        self._tongsim = TongSimGrpcClient(endpoint=endpoint)
+        spawn_loc = json.loads(opt["spawn_loc"])
+        spawn_rot = json.loads(opt["spawn_rot"])
+        camera_fov = float(opt.get("camera_fov", 120.0))
+        camera_width = int(opt.get("camera_width", 1280))
+        camera_height = int(opt.get("camera_height", 720))
+        self._spawn_loc = list(spawn_loc)
+        self._character_id = self._tongsim.spawn_character(
+            spawn_loc, spawn_rot, opt["name"], camera_fov, camera_width, camera_height
+        )
+        logger.info("probe agent spawned character {} at {}", self._character_id, self._spawn_loc)
+        self._initialized = True
+
+    def deinit(self) -> None:
+        if not self._initialized:
+            return
+        if self._tongsim:
+            try:
+                self._tongsim.close()
+            except Exception as exc:  # pragma: no cover - 清理保护
+                logger.warning("close tongsim failed: {}", exc)
+        self._tongsim = None
+        self._character_id = None
+        self._initialized = False
+
+    # ------------------------------------------------------------------ #
+    # 主循环
+    # ------------------------------------------------------------------ #
+
+    def run_step(self, subject, task_response) -> dict[str, Any]:
+        if not self._initialized:
+            return self._finish_now("not initialized")
+        self._step_no += 1
+        try:
+            if self._state == "start":
+                return self._phase_start(subject, task_response)
+            method = getattr(self, "_phase_" + self._state, None)
+            if method is None:
+                logger.warning("unknown probe state {}, finishing", self._state)
+                return self._finish_now("unknown state: " + str(self._state))
+            return method()
+        except Exception as exc:  # pragma: no cover - 探测保护：任何异常都要能收尾
+            logger.opt(exception=True).error("probe step {} crashed: {}", self._state, exc)
+            return self._finish_now("exception: " + str(exc))
+
+    # ------------------------------------------------------------------ #
+    # 相位实现
+    # ------------------------------------------------------------------ #
+
+    def _phase_start(self, subject, task_response) -> dict[str, Any]:
+        self._subject = subject if isinstance(subject, dict) else {}
+        self._record(
+            {
+                "kind": "subject",
+                "phase": self._state,
+                "subject": self._subject,
+                "task_response": task_response,
+            }
+        )
+        frame = self._acquire_and_log("initial", save_image=True)
+        ok = self._analyze(frame)
+        if not ok:
+            logger.warning("layout analysis failed, finishing without actions")
+            return self._finish_now("layout analysis failed")
+        self._record(
+            {
+                "kind": "plan",
+                "phase": self._state,
+                "movables": self._movables,
+                "empty_slots": self._empty_slots,
+                "occupied_slots": self._occupied_slots,
+            }
+        )
+        self._state = "take_wrong"
+        return self._ok("start done")
+
+    def _phase_take_wrong(self) -> dict[str, Any]:
+        block = self._pick_next_piece()
+        if block is None:
+            return self._finish_now("no piece for wrong-yaw test")
+        self._in_hand = block
+        result = self._do_take(block, "take_wrong")
+        self._state = "put_wrong"
+        return self._wrap("take_wrong", result)
+
+    def _phase_put_wrong(self) -> dict[str, Any]:
+        if self._in_hand is None:
+            self._state = "take_wrong"
+            return self._ok("hand empty, retry take")
+        slot = self._pick_empty_slot()
+        if slot is None:
+            return self._finish_now("no empty slot for wrong-yaw put")
+        result = self._do_put(slot, yaw=0.0, auto_rotate=False, tag="put_wrong")
+        if self._result_ok(result):
+            self._mark_placed(self._in_hand, slot)
+            self._in_hand = None
+            self._state = "view_wrong"
+        else:
+            # 放置失败，手里仍拿着，先退回观察
+            logger.warning("put_wrong failed: {}", result)
+            self._state = "view_wrong"
+        return self._wrap("put_wrong", result)
+
+    def _phase_view_wrong(self) -> dict[str, Any]:
+        target = self._placed_target_of_last_put or None
+        obs = self._lookback("after_put_wrong", target=target)
+        self._record_observation("wrong_yaw", obs)
+        self._state = "undo"
+        return self._wrap("view_wrong", obs.get("meta", {}))
+
+    def _phase_undo(self) -> dict[str, Any]:
+        block = self._last_placed_block or self._pick_any_placed()
+        if block is None:
+            self._state = "undo_hand"
+            return self._ok("nothing placed to undo")
+        result = self._do_take(block, "undo_test")
+        self._undo_res = result
+        if self._result_ok(result):
+            self._in_hand = block
+            self._placed.pop(block, None)
+            self._release_slot_of(block)
+        self._state = "undo_hand"
+        return self._wrap("undo", result)
+
+    def _phase_undo_hand(self) -> dict[str, Any]:
+        has_obj, _ = self._safe_hand()
+        if not has_obj:
+            self._in_hand = None
+        self._record({"kind": "hand", "phase": self._state, "has_object_in_hand": has_obj})
+        self._state = "put_auto"
+        return self._ok("undo_hand checked")
+
+    def _phase_put_auto(self) -> dict[str, Any]:
+        if self._in_hand is None:
+            # undo 失败或没有可用的块：从待放块里再拿一块做 auto_rotate 测试
+            self._need_auto_piece = True
+            self._state = "take_more"
+            return self._ok("no hand piece, will take another for auto test")
+        slot = self._pick_empty_slot()
+        if slot is None:
+            return self._finish_now("no empty slot for auto_rotate put")
+        result = self._do_put(slot, yaw=None, auto_rotate=True, tag="put_auto")
+        if self._result_ok(result):
+            self._mark_placed(self._in_hand, slot)
+            self._in_hand = None
+        self._state = "view_auto"
+        return self._wrap("put_auto", result)
+
+    def _phase_view_auto(self) -> dict[str, Any]:
+        obs = self._lookback("after_put_auto", target=self._last_auto_slot)
+        self._record_observation("auto_rotate", obs)
+        self._state = "take_more"
+        return self._wrap("view_auto", obs.get("meta", {}))
+
+    def _phase_take_more(self) -> dict[str, Any]:
+        if self._in_hand is not None:
+            # 上一块 put 失败仍拿在手里：先去尝试放下，避免重复抓取
+            self._state = "put_more"
+            return self._ok("still holding a piece, put it first")
+        if self._need_auto_piece:
+            block = self._pick_next_piece()
+            if block is None:
+                return self._finish_now("no piece left for auto test")
+            self._in_hand = block
+            result = self._do_take(block, "take_for_auto")
+            self._need_auto_piece = False
+            self._state = "put_auto"
+            return self._wrap("take_for_auto", result)
+        block = self._pick_next_piece()
+        if block is None:
+            return self._finish_now("all pieces placed")
+        self._in_hand = block
+        result = self._do_take(block, "take_more")
+        self._state = "put_more"
+        return self._wrap("take_more", result)
+
+    def _phase_put_more(self) -> dict[str, Any]:
+        if self._in_hand is None:
+            self._state = "take_more"
+            return self._ok("hand empty, retry")
+        slot = self._pick_empty_slot()
+        if slot is None:
+            return self._finish_now("no empty slot left")
+        result = self._do_put(slot, yaw=81.0, auto_rotate=False, tag="put_more")
+        if self._result_ok(result):
+            self._mark_placed(self._in_hand, slot)
+            self._in_hand = None
+        self._state = "take_more"
+        return self._wrap("put_more", result)
+
+    # ------------------------------------------------------------------ #
+    # 探测原语
+    # ------------------------------------------------------------------ #
+
+    def _do_take(self, block: str, tag: str) -> dict[str, Any]:
+        try:
+            result = self._tongsim.move_and_take_object(self._character_id, block, which_hand=0) or {}
+        except Exception as exc:
+            result = {"result": "failed", "error": str(exc)}
+        self._record({"kind": "action", "phase": tag, "action": "move_and_take_object", "object_id": block, "result": result})
+        time.sleep(1.0)
+        return result
+
+    def _do_put(self, slot: list[float], yaw: float | None, auto_rotate: bool, tag: str) -> dict[str, Any]:
+        loc = self._slot_loc(slot)
+        rotation = None if yaw is None else Rotation(roll=0.0, yaw=float(yaw), pitch=0.0)
+        try:
+            result = self._tongsim.put_down_sth(
+                self._character_id,
+                target_location=loc,
+                target_rotation=rotation,
+                auto_rotate=bool(auto_rotate),
+                force_locate=True,
+            ) or {}
+        except Exception as exc:
+            result = {"result": "failed", "error": str(exc)}
+        self._record(
+            {
+                "kind": "action",
+                "phase": tag,
+                "action": "put_down_sth",
+                "target_location": loc,
+                "rotation": None if rotation is None else {"roll": rotation.roll, "yaw": rotation.yaw, "pitch": rotation.pitch},
+                "auto_rotate": auto_rotate,
+                "result": result,
+            }
+        )
+        time.sleep(1.0)
+        return result
+
+    def _lookback(self, tag: str, target: list[float] | None = None) -> dict[str, Any]:
+        """回到出生观察点面向板面，全量抓一帧，确认块是否锁定/弹回。"""
+        meta: dict[str, Any] = {"spawn_loc": self._spawn_loc}
+        try:
+            spawn = {"X": self._spawn_loc[0], "Y": self._spawn_loc[1], "Z": self._spawn_loc[2]}
+            move_res = self._tongsim.move_to_location(self._character_id, spawn, stop_distance=1.0)
+            meta["move_result"] = move_res
+        except Exception as exc:
+            meta["move_error"] = str(exc)
+        try:
+            center = self._board_center()
+            look_res = self._tongsim.look_at_location(self._character_id, center)
+            meta["look_result"] = look_res
+        except Exception as exc:
+            meta["look_error"] = str(exc)
+        time.sleep(1.5)
+        frame = self._acquire_and_log(tag, save_image=True)
+        meta["visible_count"] = len(frame.get("objects", []))
+        return {"frame": frame, "meta": meta}
+
+    def _acquire_and_log(self, tag: str, save_image: bool = False) -> dict[str, Any]:
+        try:
+            perception = self._tongsim.acquire_first_person_perception(self._character_id, width=1280, height=720) or {}
+        except Exception as exc:
+            logger.error("perception failed at {}: {}", tag, exc)
+            perception = {}
+        image_b64 = perception.get("image")
+        image_path = ""
+        if save_image and image_b64:
+            image_path = self._save_image(image_b64, tag)
+        objects = perception.get("objects", []) or []
+        record = {"kind": "frame", "phase": tag, "step": self._step_no, "image_path": image_path, "objects": objects}
+        self._record(record)
+        return {"objects": objects, "image_path": image_path}
+
+    # ------------------------------------------------------------------ #
+    # 几何分析
+    # ------------------------------------------------------------------ #
+
+    def _analyze(self, frame: dict[str, Any]) -> bool:
+        blocks: list[dict[str, Any]] = []
+        for obj in frame.get("objects", []):
+            loc = obj.get("place_location") or {}
+            rot = obj.get("rotation") or {}
+            x = loc.get("X")
+            y = loc.get("Y")
+            z = loc.get("Z")
+            yaw = rot.get("yaw")
+            if x is None or y is None or z is None or yaw is None:
+                continue
+            if abs(float(x) - 837.0) > self._BOARD_X_TOL:
+                continue
+            if abs(float(yaw) - 80.99999237060547) > self._YAW_81_TOL:
+                continue
+            if 80.0 < float(y) < 220.0:
+                blocks.append({"id": str(obj.get("object_id")), "loc": [float(y), float(z)], "yaw": float(yaw)})
+
+        if len(blocks) < 9:
+            self._record({"kind": "analysis_failed", "candidates": blocks})
+            return False
+
+        # 区分板面已放块（Y 行 155/166/177 附近的 6 块）与待放块（出生行 Y~209）
+        board_rows = sorted({round(b["loc"][0], 1) for b in blocks if abs(b["loc"][0] - 209.0) > 5.0})
+        spawn_row = sorted({round(b["loc"][0], 1) for b in blocks if abs(b["loc"][0] - 209.0) <= 5.0})
+        if len(spawn_row) != 1 or len(board_rows) != 3:
+            self._record({"kind": "analysis_failed", "board_rows": board_rows, "spawn_row": spawn_row, "blocks": blocks})
+            return False
+        board_blocks = [b for b in blocks if abs(b["loc"][0] - spawn_row[0]) > 5.0]
+        movable_blocks = sorted([b for b in blocks if abs(b["loc"][0] - spawn_row[0]) <= 5.0], key=lambda b: b["loc"][1])
+        if len(board_blocks) != 6 or len(movable_blocks) != 3:
+            self._record({"kind": "analysis_failed", "board_blocks": board_blocks, "movable_blocks": movable_blocks})
+            return False
+
+        cols = sorted({round(b["loc"][1], 1) for b in board_blocks})
+        if len(cols) != 3:
+            self._record({"kind": "analysis_failed", "board_blocks": board_blocks, "cols": cols})
+            return False
+        filled_cells = {(round(b["loc"][0], 1), round(b["loc"][1], 1)) for b in board_blocks}
+        empty_slots = []
+        for row in board_rows:
+            for col in cols:
+                if (round(row, 1), round(col, 1)) not in filled_cells:
+                    empty_slots.append([row, col])
+        empty_slots.sort(key=lambda c: (c[0], c[1]))
+
+        self._movables = [b["id"] for b in movable_blocks]
+        self._empty_slots = empty_slots
+        self._board_rows = board_rows
+        self._board_cols = cols
+        self._spawn_row = spawn_row[0]
+        self._last_placed_block = None
+        self._placed_target_of_last_put = None
+        self._last_auto_slot = None
+        logger.info(
+            "layout: movables={} empty_slots={} board_rows={} cols={}",
+            self._movables,
+            self._empty_slots,
+            board_rows,
+            cols,
+        )
+        return True
+
+    def _board_center(self) -> dict[str, float]:
+        rows = getattr(self, "_board_rows", [166.0])
+        cols = getattr(self, "_board_cols", [99.0])
+        return {"X": 837.0, "Y": float(sum(rows) / len(rows)), "Z": float(sum(cols) / len(cols))}
+
+    def _pick_next_piece(self) -> str | None:
+        for block in self._movables:
+            if block not in self._placed and block != self._in_hand:
+                return block
+        return None
+
+    def _pick_any_placed(self) -> str | None:
+        return next(iter(self._placed.keys()), None)
+
+    def _pick_empty_slot(self) -> list[float] | None:
+        for slot in self._empty_slots:
+            if slot not in self._occupied_slots:
+                return slot
+        return None
+
+    def _mark_placed(self, block: str, slot: list[float]) -> None:
+        self._placed[block] = list(slot)
+        if slot not in self._occupied_slots:
+            self._occupied_slots.append(list(slot))
+        self._last_placed_block = block
+        self._placed_target_of_last_put = list(slot)
+        self._last_auto_slot = list(slot)
+
+    def _release_slot_of(self, block: str) -> None:
+        slot = self._placed.pop(block, None)
+        if slot and slot in self._occupied_slots:
+            self._occupied_slots.remove(slot)
+
+    def _record_observation(self, tag: str, obs: dict[str, Any]) -> None:
+        objects = obs.get("frame", {}).get("objects", [])
+        info: list[dict[str, Any]] = []
+        for obj in objects:
+            loc = obj.get("place_location") or {}
+            rot = obj.get("rotation") or {}
+            y = loc.get("Y")
+            z = loc.get("Z")
+            if y is None or z is None:
+                continue
+            if 145.0 <= float(y) <= 215.0 and 75.0 <= float(z) <= 115.0:
+                info.append(
+                    {
+                        "object_id": obj.get("object_id"),
+                        "location": loc,
+                        "rotation": rot,
+                    }
+                )
+        self._record({"kind": "observation", "tag": tag, "board_area_objects": info, "meta": obs.get("meta", {})})
+
+    # ------------------------------------------------------------------ #
+    # 工具
+    # ------------------------------------------------------------------ #
+
+    def _slot_loc(self, slot: list[float]) -> dict[str, float]:
+        return {"X": 837.0, "Y": float(slot[0]), "Z": float(slot[1])}
+
+    def _safe_hand(self) -> tuple[bool, Any]:
+        try:
+            return self._tongsim.has_object_in_hand(self._character_id)
+        except Exception as exc:
+            logger.warning("has_object_in_hand failed: {}", exc)
+            return False, None
+
+    def _save_image(self, image_b64: str, tag: str) -> str:
+        try:
+            payload = image_b64.split(",", 1)[1] if image_b64.startswith("data:image") else image_b64
+            image_bytes = base64.b64decode(payload, validate=True)
+            log_dir = os.path.join(getattr(self.cfg, "log_dir", "") or "logs", "recon")
+            os.makedirs(log_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(log_dir, "probe_{}_{}_{}.jpg".format(self.agent_id, tag, timestamp))
+            with open(path, "wb") as handle:
+                handle.write(image_bytes)
+            return path
+        except Exception as exc:  # pragma: no cover - 图片保存保护
+            logger.warning("save image {} failed: {}", tag, exc)
+            return ""
+
+    def _record(self, record: dict[str, Any]) -> None:
+        record.setdefault("ts", datetime.now().isoformat(timespec="seconds"))
+        record.setdefault("step", self._step_no)
+        logger.info("[probe] {} {}", record.get("kind"), json.dumps(record, ensure_ascii=False, default=str)[:400])
+        if not self._record_path:
+            return
+        try:
+            with open(self._record_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        except Exception as exc:  # pragma: no cover - 记录保护
+            logger.warning("write probe record failed: {}", exc)
+
+    @staticmethod
+    def _result_ok(result: dict[str, Any] | None) -> bool:
+        return isinstance(result, dict) and result.get("result") != "failed"
+
+    def _ok(self, msg: str) -> dict[str, Any]:
+        return {"result": "success", "probe_step": self._state, "msg": msg}
+
+    def _wrap(self, phase: str, result: dict[str, Any]) -> dict[str, Any]:
+        return {"result": "success" if self._result_ok(result) else "failed", "probe_step": phase, "detail": result}
+
+    def _finish_now(self, reason: str) -> dict[str, Any]:
+        if self._finish_done:
+            return {"result": "success", "answer": "probe finished"}
+        self._finish_done = True
+        summary = {
+            "reason": reason,
+            "placed": {k: v for k, v in self._placed.items()},
+            "undo_result": self._undo_res,
+            "occupied_slots": self._occupied_slots,
+        }
+        self._record({"kind": "finish", "summary": summary})
+        text = "probe_recon_done placed=" + json.dumps(summary.get("placed", {}), ensure_ascii=False) + " 0"
+        return super()._handle_finish({}, {"think": "", "output": text})
