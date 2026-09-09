@@ -62,6 +62,8 @@ class JigsawProbeAgent(AgentBase):
         self._need_auto_piece = False
         self._finish_done = False
         self._target_yaw: float | None = None
+        self._scan_only = os.environ.get("PROBE_SCAN_ONLY", "").strip().lower() in ("1", "true", "yes")
+        self._scan_phase = "shelf"
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -139,6 +141,11 @@ class JigsawProbeAgent(AgentBase):
         if not ok:
             logger.warning("layout analysis failed, finishing without actions")
             return self._finish_now("layout analysis failed")
+        if self._scan_only:
+            # 侦察模式：只在原图分辨率下抓若干视角，不做任何取放
+            self._record({"kind": "scan_mode", "phase": self._state, "note": "PROBE_SCAN_ONLY, native acquire"})
+            self._state = "scan"
+            return self._ok("scan mode start")
         self._record(
             {
                 "kind": "plan",
@@ -264,6 +271,39 @@ class JigsawProbeAgent(AgentBase):
         self._state = "take_more"
         return self._wrap("put_more", result)
 
+    def _phase_scan(self) -> dict[str, Any]:
+        if self._scan_phase == "shelf":
+            center = {"X": 837.0, "Y": float(self._spawn_row), "Z": float(sum(getattr(self, "_board_cols", [99.0])) / 3)}
+            try:
+                self._tongsim.look_at_location(self._character_id, center)
+            except Exception as exc:
+                logger.warning("look shelf failed: {}", exc)
+            time.sleep(1.0)
+            self._acquire_and_log("scan_shelf", save_image=True)
+            self._scan_phase = "board"
+            return self._ok("scan shelf done")
+        if self._scan_phase == "board":
+            try:
+                self._tongsim.look_at_location(self._character_id, self._board_center())
+            except Exception as exc:
+                logger.warning("look board failed: {}", exc)
+            time.sleep(1.0)
+            self._acquire_and_log("scan_board", save_image=True)
+            self._scan_phase = "close"
+            return self._ok("scan board done")
+        if self._scan_phase == "close":
+            # 走近出生区看板面，尽量放大拼图块
+            try:
+                spawn = {"X": self._spawn_loc[0], "Y": self._spawn_loc[1], "Z": self._spawn_loc[2]}
+                self._tongsim.move_to_location(self._character_id, spawn, stop_distance=1.0)
+                self._tongsim.look_at_location(self._character_id, self._board_center())
+            except Exception as exc:
+                logger.warning("close view failed: {}", exc)
+            time.sleep(1.0)
+            self._acquire_and_log("scan_close_board", save_image=True)
+            return self._finish_now("scan only done")
+        return self._finish_now("scan done")
+
     # ------------------------------------------------------------------ #
     # 探测原语
     # ------------------------------------------------------------------ #
@@ -326,7 +366,10 @@ class JigsawProbeAgent(AgentBase):
 
     def _acquire_and_log(self, tag: str, save_image: bool = False) -> dict[str, Any]:
         try:
-            perception = self._tongsim.acquire_first_person_perception(self._character_id, width=1280, height=720) or {}
+            if self._scan_only:
+                perception = self._tongsim.acquire_first_person_perception(self._character_id) or {}
+            else:
+                perception = self._tongsim.acquire_first_person_perception(self._character_id, width=1280, height=720) or {}
         except Exception as exc:
             logger.error("perception failed at {}: {}", tag, exc)
             perception = {}
