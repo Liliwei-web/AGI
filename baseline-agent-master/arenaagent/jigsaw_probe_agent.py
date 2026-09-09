@@ -67,9 +67,12 @@ class JigsawProbeAgent(AgentBase):
         self._target_yaw: float | None = None
         self._scan_only = os.environ.get("PROBE_SCAN_ONLY", "").strip().lower() in ("1", "true", "yes")
         self._color_scan = os.environ.get("PROBE_COLORSCAN", "").strip().lower() in ("1", "true", "yes")
+        self._face_scan = os.environ.get("PROBE_FACE", "").strip().lower() in ("1", "true", "yes")
         self._scan_phase = "shelf"
         self._color_cells: list[dict[str, Any]] = []
         self._color_idx = 0
+        self._face_idx = 0
+        self._face_phase = "take"
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -157,6 +160,10 @@ class JigsawProbeAgent(AgentBase):
             self._record({"kind": "color_scan", "phase": self._state, "cells": self._color_cells})
             self._state = "color"
             return self._ok("color scan start")
+        if self._face_scan:
+            self._record({"kind": "face_scan", "phase": self._state, "movables": self._movables})
+            self._state = "face"
+            return self._ok("face scan start")
         self._record(
             {
                 "kind": "plan",
@@ -314,6 +321,63 @@ class JigsawProbeAgent(AgentBase):
             self._acquire_and_log("scan_close_board", save_image=True)
             return self._finish_now("scan only done")
         return self._finish_now("scan done")
+
+    def _phase_face(self) -> dict[str, Any]:
+        if self._face_idx >= len(self._movables):
+            return self._finish_now("face scan done")
+        piece = self._movables[self._face_idx]
+        if self._face_phase == "take":
+            self._in_hand = piece
+            result = self._do_take(piece, "face_take")
+            time.sleep(0.6)
+            try:
+                perception = self._tongsim.acquire_first_person_perception(self._character_id) or {}
+                self._save_image(perception.get("image") or "", "held_raw_{}".format(piece))
+            except Exception as exc:
+                logger.warning("held raw capture failed: {}", exc)
+            self._face_phase = "look"
+            return self._wrap("face_take", result)
+        if self._face_phase == "look":
+            try:
+                self._tongsim.look_at_object(self._character_id, piece)
+            except Exception as exc:
+                logger.warning("look_at_object {} failed: {}", piece, exc)
+            time.sleep(1.0)
+            try:
+                perception = self._tongsim.acquire_first_person_perception(self._character_id) or {}
+                image_b64 = perception.get("image") or ""
+                image_path = self._save_image(image_b64, "held_look_{}".format(piece))
+                stats = self._crop_center_stats(image_b64, {"kind": "held", "object_id": piece})
+                self._record({"kind": "face_sample", "object_id": piece, "image_path": image_path, "stats": stats})
+            except Exception as exc:
+                logger.warning("held look capture failed: {}", exc)
+            self._face_phase = "restore"
+            return self._ok("face look done")
+        if self._face_phase == "restore":
+            target = self._probe_movable_loc(piece)
+            result = self._put_back(target) if target is not None else {}
+            self._in_hand = None
+            self._face_idx += 1
+            self._face_phase = "take"
+            return self._wrap("face_restore", result)
+        return self._ok("face")
+
+    def _put_back(self, target: dict[str, float]) -> dict[str, Any]:
+        rotation = Rotation(roll=0.0, yaw=float(self._target_yaw or 0.0), pitch=0.0)
+        try:
+            result = self._tongsim.put_down_sth(
+                self._character_id,
+                target_location=target,
+                target_rotation=rotation,
+                auto_rotate=False,
+                force_locate=True,
+            ) or {}
+        except Exception as exc:
+            result = {"result": "failed", "error": str(exc)}
+        self._record(
+            {"kind": "action", "phase": "face_restore", "action": "put_down_sth", "target_location": target, "result": result}
+        )
+        return result
 
     def _phase_color(self) -> dict[str, Any]:
         if self._color_idx >= len(self._color_cells):
