@@ -68,11 +68,15 @@ class JigsawProbeAgent(AgentBase):
         self._scan_only = os.environ.get("PROBE_SCAN_ONLY", "").strip().lower() in ("1", "true", "yes")
         self._color_scan = os.environ.get("PROBE_COLORSCAN", "").strip().lower() in ("1", "true", "yes")
         self._face_scan = os.environ.get("PROBE_FACE", "").strip().lower() in ("1", "true", "yes")
+        self._place_scan = os.environ.get("PROBE_PLACE", "").strip().lower() in ("1", "true", "yes")
         self._scan_phase = "shelf"
         self._color_cells: list[dict[str, Any]] = []
         self._color_idx = 0
         self._face_idx = 0
         self._face_phase = "take"
+        self._place_phase = "pre"
+        self._place_piece: str | None = None
+        self._place_slot: list[float] | None = None
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -164,6 +168,12 @@ class JigsawProbeAgent(AgentBase):
             self._record({"kind": "face_scan", "phase": self._state, "movables": self._movables})
             self._state = "face"
             return self._ok("face scan start")
+        if self._place_scan:
+            self._place_piece = self._movables[0] if self._movables else None
+            self._place_slot = list(self._empty_slots[0]) if self._empty_slots else None
+            self._record({"kind": "place_scan", "phase": self._state, "piece": self._place_piece, "slot": self._place_slot})
+            self._state = "place"
+            return self._ok("place scan start")
         self._record(
             {
                 "kind": "plan",
@@ -361,6 +371,43 @@ class JigsawProbeAgent(AgentBase):
             self._face_phase = "take"
             return self._wrap("face_restore", result)
         return self._ok("face")
+
+    def _phase_place(self) -> dict[str, Any]:
+        if self._place_piece is None or self._place_slot is None:
+            return self._finish_now("place scan missing piece/slot")
+        if self._place_phase == "pre":
+            # 放入前先采空槽颜色
+            self._sample_cell_color({"kind": "slot_before", "object_id": "", "y": self._place_slot[0], "z": self._place_slot[1]})
+            self._place_phase = "take"
+            return self._ok("slot_before sampled")
+        if self._place_phase == "take":
+            self._in_hand = self._place_piece
+            result = self._do_take(self._place_piece, "place_take")
+            self._place_phase = "place"
+            return self._wrap("place_take", result)
+        if self._place_phase == "place":
+            result = self._do_put(self._place_slot, yaw=self._target_yaw, auto_rotate=False, tag="place_put")
+            if self._result_ok(result):
+                self._in_hand = None
+            self._place_phase = "after"
+            return self._wrap("place_put", result)
+        if self._place_phase == "after":
+            # 放入后采该槽颜色，比对是否出现图案正面
+            self._sample_cell_color({"kind": "slot_after", "object_id": self._place_piece, "y": self._place_slot[0], "z": self._place_slot[1]})
+            self._place_phase = "undo"
+            return self._ok("slot_after sampled")
+        if self._place_phase == "undo":
+            result = self._do_take(self._place_piece, "place_undo")
+            if self._result_ok(result):
+                self._in_hand = self._place_piece
+            self._place_phase = "putback"
+            return self._wrap("place_undo", result)
+        if self._place_phase == "putback":
+            target = self._probe_movable_loc(self._place_piece)
+            result = self._put_back(target) if target is not None else {}
+            self._in_hand = None
+            return self._finish_now("place scan done")
+        return self._finish_now("place scan done")
 
     def _put_back(self, target: dict[str, float]) -> dict[str, Any]:
         rotation = Rotation(roll=0.0, yaw=float(self._target_yaw or 0.0), pitch=0.0)
