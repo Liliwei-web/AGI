@@ -36,7 +36,6 @@ class JigsawProbeAgent(AgentBase):
     """
 
     _BOARD_X_TOL = 2.0
-    _YAW_81_TOL = 5.0
 
     def __init__(self, stub, channel, cfg=None, sleep_between_steps: float = 1.0) -> None:
         super().__init__(
@@ -62,6 +61,7 @@ class JigsawProbeAgent(AgentBase):
         self._undo_res: dict[str, Any] = {}
         self._need_auto_piece = False
         self._finish_done = False
+        self._target_yaw: float | None = None
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -167,7 +167,7 @@ class JigsawProbeAgent(AgentBase):
         slot = self._pick_empty_slot()
         if slot is None:
             return self._finish_now("no empty slot for wrong-yaw put")
-        result = self._do_put(slot, yaw=0.0, auto_rotate=False, tag="put_wrong")
+        result = self._do_put(slot, yaw=self._wrong_yaw(), auto_rotate=False, tag="put_wrong")
         if self._result_ok(result):
             self._mark_placed(self._in_hand, slot)
             self._in_hand = None
@@ -194,7 +194,6 @@ class JigsawProbeAgent(AgentBase):
         self._undo_res = result
         if self._result_ok(result):
             self._in_hand = block
-            self._placed.pop(block, None)
             self._release_slot_of(block)
         self._state = "undo_hand"
         return self._wrap("undo", result)
@@ -258,7 +257,7 @@ class JigsawProbeAgent(AgentBase):
         slot = self._pick_empty_slot()
         if slot is None:
             return self._finish_now("no empty slot left")
-        result = self._do_put(slot, yaw=81.0, auto_rotate=False, tag="put_more")
+        result = self._do_put(slot, yaw=self._target_yaw, auto_rotate=False, tag="put_more")
         if self._result_ok(result):
             self._mark_placed(self._in_hand, slot)
             self._in_hand = None
@@ -348,23 +347,31 @@ class JigsawProbeAgent(AgentBase):
         blocks: list[dict[str, Any]] = []
         for obj in frame.get("objects", []):
             loc = obj.get("place_location") or {}
-            rot = obj.get("rotation") or {}
-            x = loc.get("X")
             y = loc.get("Y")
             z = loc.get("Z")
-            yaw = rot.get("yaw")
-            if x is None or y is None or z is None or yaw is None:
+            if y is None or z is None:
                 continue
-            if abs(float(x) - 837.0) > self._BOARD_X_TOL:
+            if not self._is_jigsaw_block(obj):
                 continue
-            if abs(float(yaw) - 80.99999237060547) > self._YAW_81_TOL:
-                continue
-            if 80.0 < float(y) < 220.0:
-                blocks.append({"id": str(obj.get("object_id")), "loc": [float(y), float(z)], "yaw": float(yaw)})
+            yaw = (obj.get("rotation") or {}).get("yaw")
+            blocks.append(
+                {
+                    "id": str(obj.get("object_id")),
+                    "loc": [float(y), float(z)],
+                    "yaw": float(yaw) if yaw is not None else 0.0,
+                }
+            )
 
         if len(blocks) < 9:
             self._record({"kind": "analysis_failed", "candidates": blocks})
             return False
+
+        # 板面朝向 yaw：以当前局所有拼图块众数角度为放置基准（每局可能不同）
+        from collections import Counter
+
+        yaw_counter = Counter(round(b["yaw"], 1) for b in blocks)
+        self._target_yaw = float(yaw_counter.most_common(1)[0][0])
+        self._record({"kind": "layout_yaw", "yaw_counter": dict(yaw_counter), "target_yaw": self._target_yaw})
 
         # 区分板面已放块（Y 行 155/166/177 附近的 6 块）与待放块（出生行 Y~209）
         board_rows = sorted({round(b["loc"][0], 1) for b in blocks if abs(b["loc"][0] - 209.0) > 5.0})
@@ -399,13 +406,43 @@ class JigsawProbeAgent(AgentBase):
         self._placed_target_of_last_put = None
         self._last_auto_slot = None
         logger.info(
-            "layout: movables={} empty_slots={} board_rows={} cols={}",
+            "layout: movables={} empty_slots={} board_rows={} cols={} target_yaw={}",
             self._movables,
             self._empty_slots,
             board_rows,
             cols,
+            self._target_yaw,
         )
         return True
+
+    @staticmethod
+    def _is_jigsaw_block(obj: dict[str, Any]) -> bool:
+        """按位置与包围盒识别拼图块，排除墙面参考大图（object 16）与家具。"""
+        loc = obj.get("place_location") or {}
+        x = loc.get("X")
+        y = loc.get("Y")
+        z = loc.get("Z")
+        if x is None or y is None or z is None:
+            return False
+        if abs(float(x) - 837.0) > 2.0:
+            return False
+        if not (120.0 <= float(y) <= 225.0):
+            return False
+        if not (60.0 <= float(z) <= 125.0):
+            return False
+        aabb = obj.get("world_aabb") or {}
+        mini = aabb.get("min") or {}
+        maxi = aabb.get("max") or {}
+        if mini and maxi:
+            x_ext = abs(float(maxi.get("x", 0.0)) - float(mini.get("x", 0.0)))
+            y_ext = abs(float(maxi.get("y", 0.0)) - float(mini.get("y", 0.0)))
+            z_ext = abs(float(maxi.get("z", 0.0)) - float(mini.get("z", 0.0)))
+            if x_ext > 4.0 or y_ext > 30.0 or z_ext > 30.0 or y_ext < 5.0 or z_ext < 5.0:
+                return False
+        return True
+
+    def _wrong_yaw(self) -> float:
+        return float((self._target_yaw or 0.0) + 90.0)
 
     def _board_center(self) -> dict[str, float]:
         rows = getattr(self, "_board_rows", [166.0])
