@@ -102,3 +102,9 @@
 - piece 14 (rightmost spawn) -> (166.0, 88.0) mid-left
 - Permutation scores (all three placed, target-yaw): this best map 92.0/92.43; {8->155,99;10->166,110;14->166,88} 78.0; {8->166,88;14->155,99;10->166,110} 71.0; natural order 46.0. Best map reproducible across runs.
 - SOLVE=1 mode auto-applies the mapping when the empty pattern matches; otherwise leaves the board untouched (avoids the wrong-placement penalty).
+
+## Update: auto_rotate reaches full score (2026-09-09)
+- PROBE_EVAL all-auto yaw for 8->mid-right(166,110), 10->top-mid(155,99), 14->mid-left(166,88) => jigsaw_score 100.0 / score 98.83 in 2/2 runs.
+- Explicit board-mode yaw on the same map caps at jigsaw 92; explicit yaw on piece 10 visually flips it (pitch=-90 in object list).
+- SOLVE mode now emits auto yaw for all three pieces.
+

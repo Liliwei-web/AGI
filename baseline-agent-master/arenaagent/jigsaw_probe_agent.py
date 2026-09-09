@@ -441,7 +441,7 @@ class JigsawProbeAgent(AgentBase):
     # 确定性贪心控制器（读色-指派-放置）
     # ------------------------------------------------------------------ #
 
-    def _build_solve_spec(self) -> list[tuple[str, float, float, float | None]]:
+    def _build_solve_spec(self) -> list[tuple[str, float, float, float | str | None]]:
         # Learned per-run stable mapping (validated by probe evals on the train subject):
         # visible-id -> slot for the empty pattern {top-mid, mid-left, mid-right}.
         # Best probe: 8->mid-right(166,110), 10->top-mid(155,99), 14->mid-left(166,88) => jigsaw 92.
@@ -458,7 +458,7 @@ class JigsawProbeAgent(AgentBase):
             target = table.get(bid)
             if target is None:
                 return []
-            out.append((bid, target[0], target[1], None))
+            out.append((bid, target[0], target[1], "auto"))
         return out
 
     def _parse_eval_spec(self, raw: str) -> list[tuple[str, float, float, float | None]]:
