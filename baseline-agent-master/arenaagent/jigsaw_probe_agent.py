@@ -54,6 +54,8 @@ class JigsawProbeAgent(AgentBase):
         # 探测运行期状态
         self._subject: dict[str, Any] = {}
         self._movables: list[str] = []  # 待放块 object_id（按出生位置排序）
+        self._board_blocks: list[dict[str, Any]] = []  # 已放 6 块（id/loc/yaw）
+        self._last_frame_objects: list[dict[str, Any]] = []  # 最近一帧全量物体
         self._placed: dict[str, list[float]] = {}  # block_id -> slot [y,z]
         self._occupied_slots: list[list[float]] = []  # 已被占用的空槽 [y,z]
         self._empty_slots: list[list[float]] = []  # 初始空槽 [y,z]
@@ -63,7 +65,10 @@ class JigsawProbeAgent(AgentBase):
         self._finish_done = False
         self._target_yaw: float | None = None
         self._scan_only = os.environ.get("PROBE_SCAN_ONLY", "").strip().lower() in ("1", "true", "yes")
+        self._color_scan = os.environ.get("PROBE_COLORSCAN", "").strip().lower() in ("1", "true", "yes")
         self._scan_phase = "shelf"
+        self._color_cells: list[dict[str, Any]] = []
+        self._color_idx = 0
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -146,6 +151,11 @@ class JigsawProbeAgent(AgentBase):
             self._record({"kind": "scan_mode", "phase": self._state, "note": "PROBE_SCAN_ONLY, native acquire"})
             self._state = "scan"
             return self._ok("scan mode start")
+        if self._color_scan:
+            self._build_color_cells()
+            self._record({"kind": "color_scan", "phase": self._state, "cells": self._color_cells})
+            self._state = "color"
+            return self._ok("color scan start")
         self._record(
             {
                 "kind": "plan",
@@ -304,6 +314,93 @@ class JigsawProbeAgent(AgentBase):
             return self._finish_now("scan only done")
         return self._finish_now("scan done")
 
+    def _phase_color(self) -> dict[str, Any]:
+        if self._color_idx >= len(self._color_cells):
+            return self._finish_now("color scan done")
+        cell = self._color_cells[self._color_idx]
+        self._color_idx += 1
+        self._sample_cell_color(cell)
+        return self._ok("color cell {}".format(self._color_idx))
+
+    def _build_color_cells(self) -> None:
+        """采样顺序：3 个待放块 → 3 个空槽 → 6 个已放块（标定/自检用）。"""
+        cells: list[dict[str, Any]] = []
+        for block_id in self._movables:
+            cells.append({"kind": "movable", "object_id": block_id})
+        for slot in self._empty_slots:
+            cells.append({"kind": "empty", "object_id": "", "y": slot[0], "z": slot[1], "loc": [slot[0], slot[1]]})
+        for blk in self._board_blocks:
+            cells.append({"kind": "filled", "object_id": blk["id"], "y": blk["loc"][0], "z": blk["loc"][1], "loc": list(blk["loc"])})
+        self._color_cells = cells
+
+    def _sample_cell_color(self, cell: dict[str, Any]) -> None:
+        """从固定机位（墙前 ~40cm，同 Y/Z 高度、地面高度）看向目标并裁中心做颜色直方图。"""
+        try:
+            if cell.get("kind") == "movable":
+                target = self._probe_movable_loc(cell.get("object_id", ""))
+                if target is None:
+                    logger.warning("movable {} not found in initial frame, skip", cell.get("object_id"))
+                    return
+            else:
+                target = {"X": 837.0, "Y": float(cell["y"]), "Z": float(cell["z"])}
+            stand = {"X": 797.0, "Y": float(target["Y"]), "Z": 60.0}
+            move_res = self._tongsim.move_to_location(self._character_id, stand, stop_distance=1.0)
+            if not self._result_ok(move_res):
+                # 不可达时退回出生点，仅靠 look_at 取景
+                stand = {"X": self._spawn_loc[0], "Y": self._spawn_loc[1], "Z": self._spawn_loc[2]}
+                self._tongsim.move_to_location(self._character_id, stand, stop_distance=1.0)
+            self._tongsim.look_at_location(self._character_id, target)
+            time.sleep(1.2)
+            perception = self._tongsim.acquire_first_person_perception(self._character_id) or {}
+            image_b64 = perception.get("image")
+            stats = self._crop_center_stats(image_b64, cell)
+            record = {"kind": "color_sample", "cell": cell, "stand": stand, "target": target, "stats": stats}
+            self._record(record)
+        except Exception as exc:
+            logger.warning("color sample {} failed: {}", cell, exc)
+
+    def _probe_movable_loc(self, block_id: str) -> dict[str, float] | None:
+        """用初始帧里出生行该块的 place_location 推算坐标。"""
+        for obj in self._last_frame_objects:
+            loc = obj.get("place_location") or {}
+            if str(obj.get("object_id")) != block_id:
+                continue
+            if abs(float(loc.get("X", 0.0)) - 837.0) > 2.0:
+                continue
+            return {"X": 837.0, "Y": float(loc["Y"]), "Z": float(loc["Z"])}
+        return None
+
+    def _crop_center_stats(self, image_b64: str | None, cell: dict[str, Any]) -> dict[str, Any]:
+        if not image_b64:
+            return {"error": "no image"}
+        try:
+            import io
+
+            from PIL import Image
+
+            payload = image_b64.split(",", 1)[1] if image_b64.startswith("data:image") else image_b64
+            im = Image.open(io.BytesIO(base64.b64decode(payload, validate=True))).convert("RGB")
+            w, h = im.size
+            side = max(24, min(int(h * 0.12), int(w * 0.08)))
+            cx, cy = w // 2, h // 2
+            crop = im.crop((cx - side, cy - side, cx + side, cy + side))
+            log_dir = os.path.join(getattr(self.cfg, "log_dir", "") or "logs", "recon", "crops")
+            os.makedirs(log_dir, exist_ok=True)
+            ts = datetime.now().strftime("%H%M%S")
+            name = "{}_{}_{}_{}.png".format(cell.get("kind", "c"), cell.get("object_id", "x"), cell.get("y", "-"), cell.get("z", "-"))
+            path = os.path.join(log_dir, name)
+            crop.save(path)
+            data = list(crop.getdata())
+            n = len(data)
+            mean = [round(sum(p[i] for p in data) / n, 1) for i in range(3)]
+            buckets: Counter = Counter()
+            for p in data:
+                buckets[tuple(((c // 32) * 32 + 16) for c in p)] += 1
+            top = [{"rgb": list(c), "share": round(cnt / n, 3)} for c, cnt in buckets.most_common(5)]
+            return {"image_path": path, "image_size": [w, h], "crop_side": side, "mean_rgb": mean, "top_colors": top}
+        except Exception as exc:
+            return {"error": str(exc)}
+
     # ------------------------------------------------------------------ #
     # 探测原语
     # ------------------------------------------------------------------ #
@@ -378,6 +475,7 @@ class JigsawProbeAgent(AgentBase):
         if save_image and image_b64:
             image_path = self._save_image(image_b64, tag)
         objects = perception.get("objects", []) or []
+        self._last_frame_objects = objects
         record = {"kind": "frame", "phase": tag, "step": self._step_no, "image_path": image_path, "objects": objects}
         self._record(record)
         return {"objects": objects, "image_path": image_path}
@@ -441,6 +539,7 @@ class JigsawProbeAgent(AgentBase):
         empty_slots.sort(key=lambda c: (c[0], c[1]))
 
         self._movables = [b["id"] for b in movable_blocks]
+        self._board_blocks = board_blocks
         self._empty_slots = empty_slots
         self._board_rows = board_rows
         self._board_cols = cols
