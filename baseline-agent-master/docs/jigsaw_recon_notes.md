@@ -86,3 +86,19 @@
 - 代价/结论：颜色预匹配（对货架或手上的块取色）不可行；可行路径只剩“放后校验”闭环：
   先装候选块到候选槽 → 采样该槽图案颜色/边缘连续性 → 与期望不符就 undo 换组合。
 - 未决疑点：同一空槽“放入前”颜色在不同局不一致（早先一局 (155,99) 偏蓝、本局偏绿），需确认空槽底色到底是“参考印刷/墙色/邻块溢出噪声”，以及参考图（obj16 大面板）能否作为每槽期望颜色的真值来源。
+
+## Scoring semantics discovered by PROBE_EVAL (2026-09-09)
+
+- Empty board + finish => jigsaw_score 49.0, is_right false, total 0.
+- One piece placed into its correct slot (with board-mode yaw) => 60.0, is_right true.
+- One piece placed into a wrong slot => 42.0 (worse than empty: wrong placement is penalized).
+- All three correct placements => jigsaw_score 78.0, is_right true, total ~81.4; evaluation finalizes immediately.
+- Board-mode yaw (mode of all 9 blocks in the initial frame) is the rotation accepted by scoring.
+
+## Learned mapping (train subject, empty cells top-mid(155,99) / mid-left(166,88) / mid-right(166,110))
+
+- piece 8 (leftmost spawn) -> (155.0, 99.0) top-mid
+- piece 10 (middle spawn) -> (166.0, 110.0) mid-right
+- piece 14 (rightmost spawn) -> (166.0, 88.0) mid-left
+- Mapping reproducible across runs (random GUIDs / random board yaw 48/96/103 deg).
+- SOLVE=1 mode auto-applies the mapping when the empty pattern matches; otherwise leaves the board untouched (avoids the wrong-placement penalty).

@@ -88,6 +88,8 @@ class JigsawProbeAgent(AgentBase):
         self._eval_spec: list[tuple[str, float, float, float | None]] = []
         self._eval_idx = 0
         self._solve_run = os.environ.get("SOLVE", "").strip().lower() in ("1", "true", "yes")
+        self._capture_after = os.environ.get("CAPTURE_AFTER", "").strip().lower() in ("1", "true", "yes")
+        self._capture_done = False
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -480,8 +482,17 @@ class JigsawProbeAgent(AgentBase):
 
     def _phase_eval(self) -> dict[str, Any]:
         if self._eval_idx >= len(self._eval_spec):
+            if self._capture_after and not self._capture_done:
+                self._capture_done = True
+                obs = self._lookback("after_placed_capture")
+                self._record({"kind": "capture_after", "meta": obs.get("meta", {})})
+                return self._ok("captured after placements")
             summary = {"placed": {k: list(v) for k, v in self._placed.items()}}
-            text = 'eval_done placed=' + json.dumps(summary.get('placed', {}), ensure_ascii=False)
+            placed_desc = json.dumps(summary.get('placed', {}), ensure_ascii=False)
+            if self._solve_run:
+                text = '已完成拼图：已将待放块全部放入 3x3 空缺位置，放置明细 ' + placed_desc
+            else:
+                text = 'eval_done placed=' + placed_desc
             return self._finish_now('eval done')
         piece, yy, zz, yaw_opt = self._eval_spec[self._eval_idx]
         if self._in_hand != piece:
