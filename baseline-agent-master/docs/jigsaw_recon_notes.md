@@ -108,3 +108,16 @@
 - Explicit board-mode yaw on the same map caps at jigsaw 92; explicit yaw on piece 10 visually flips it (pitch=-90 in object list).
 - SOLVE mode now emits auto yaw for all three pieces.
 
+## 通用解法视觉匹配实验（2026-09-09，JIGSAW_GEN_DATA / JIGSAW_POSTER）
+
+- 采集模式 JIGSAW_GEN_DATA=1：逐块放入首空槽近距读图案(stand (797,155,60)，stand_close_ok 稳定)→undo 放回出生点→按真值自动放置 3 块(本局 jigsaw 100 / score 95.47 确认)→再采集已放 6 格与 3 空槽。原始 jsonl：`logs/recon/probe_0eaa1b0b3d.jsonl`。
+- 结论 1（有效）：小块图案“指纹”可分。中心 48x48px RGB 直方图余弦匹配 piece->truth 完全恢复 10->(155,99) / 14->(166,88) / 8->(166,110)，且与次优间隔明显（piece 10 与 14 在 0.95+，错配通常 <0.79）。即“放一块->近距采样小块中心”可稳定读出该块唯一图案码。
+- 结论 2（不足）：整格/邻居均值直方图、“空槽底板”直方图区分度太弱：正确排列只出现在第 1-3 名，margin ~0.005-0.03，不能作主判据。
+- 结论 3（不足）：接缝边缘连续性（带 ±4px 平移的条带色均值相关）同样分不开正确组；且 240px 中心裁窗混入槽边/背景，逐块采样自洽性差。
+- 结论 4（关键限制）：look_at_location 只有“移动后第一次取景”可靠；同一站位连续多次 look，第 1-2 次生效后不再转动（海报 9 格扫描 r0c2 之后逐帧内容完全相同）。参考图低成本逐格采集需“每格一次移动+一次 look”，或对单帧做像素几何标定。
+- 结论 5：真值放置 + auto yaw 再次满分，映射正确性可离线/复跑复现。
+
+## 下一步建议（成本从低到高）
+1. 海报单帧标定：站位 (797,105,60) 单次 look 海报中心抓 1 帧，把海报 3x3 每格当“槽期望图案码”（规避结论 4）；离线验证 piece 码 vs 海报格码可分性。
+2. 官方题库化：多次跑 run_test_jigsaw 记录不同 random 局的“空槽模式/待放可见ID/布局”，沉淀 (空槽模式 -> 映射) 查表；命中模式即按表 auto 放。
+3. 保底策略保持不变：未知 pattern 时留空板避免错放惩罚，等方案 1/2 验证后再切到全自动通用解法。

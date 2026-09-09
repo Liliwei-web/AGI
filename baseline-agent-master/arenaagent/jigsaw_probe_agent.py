@@ -90,6 +90,23 @@ class JigsawProbeAgent(AgentBase):
         self._solve_run = os.environ.get("SOLVE", "").strip().lower() in ("1", "true", "yes")
         self._capture_after = os.environ.get("CAPTURE_AFTER", "").strip().lower() in ("1", "true", "yes")
         self._capture_done = False
+        self._gen_recon = os.environ.get("JIGSAW_GEN_RECON", "").strip().lower() in ("1", "true", "yes")
+        self._gen: dict[str, Any] = {}
+        self._gen_data = os.environ.get("JIGSAW_GEN_DATA", "").strip().lower() in ("1", "true", "yes")
+        self._truth_map: dict[str, list[float]] = {}
+        for part in os.environ.get("JIGSAW_TRUTH", "").split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            seg = [x.strip() for x in part.replace("(", "").replace(")", "").split(",") if x.strip()]
+            if len(seg) >= 3:
+                try:
+                    self._truth_map[str(seg[0])] = [float(seg[1]), float(seg[2])]
+                except Exception:
+                    pass
+        self._gd: dict[str, Any] = {}
+        self._poster_scan = os.environ.get("JIGSAW_POSTER", "").strip().lower() in ("1", "true", "yes")
+
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -177,6 +194,19 @@ class JigsawProbeAgent(AgentBase):
             self._record({"kind": "solve_plan", "movables": self._movables, "empty_slots": self._empty_slots, "spec": self._eval_spec, "note": "learned mapping for known empty-slot pattern"})
             self._state = "eval"
             return self._ok("solve start")
+        if self._gen_recon:
+            self._setup_gen_recon()
+            self._state = "gen"
+            return self._ok("gen recon start")
+        if self._gen_data:
+            self._setup_gen_data()
+            self._state = "gdata"
+            return self._ok("gen data start")
+        if self._poster_scan:
+            self._setup_poster_scan()
+            self._state = "poster2"
+            return self._ok("poster scan start")
+
         if self._scan_only:
             # 侦察模式：只在原图分辨率下抓若干视角，不做任何取放
             self._record({"kind": "scan_mode", "phase": self._state, "note": "PROBE_SCAN_ONLY, native acquire"})
@@ -831,6 +861,440 @@ class JigsawProbeAgent(AgentBase):
         )
         time.sleep(1.0)
         return result
+
+
+    # ------------------------------------------------------------------ #
+    # 通用解法侦察（JIGSAW_GEN_RECON=1）
+    # 采样：参考大图 3x3 格、板面已放 6 格、以及把每块待放块放入空槽后的图案。
+    # ------------------------------------------------------------------ #
+
+    def _setup_gen_recon(self) -> None:
+        spawns: dict[str, dict[str, float]] = {}
+        for bid in self._movables:
+            loc = self._probe_movable_loc(bid)
+            if loc:
+                spawns[bid] = {"X": float(loc["X"]), "Y": float(loc["Y"]), "Z": float(loc["Z"])}
+        posters = self._find_posters()
+        self._gen = {
+            "stage": "poster",
+            "idx": 0,
+            "poster_cells": [],
+            "piece_idx": 0,
+            "pstep": "take",
+            "spawns": spawns,
+        }
+        best = None
+        for cand in posters:
+            if best is None or cand["area"] > best["area"]:
+                best = cand
+        if best is not None:
+            self._gen["poster_cells"] = self._gen_grid(best)
+        self._record(
+            {
+                "kind": "gen_setup",
+                "posters": posters,
+                "picked": best,
+                "spawns": spawns,
+                "empty_slots": self._empty_slots,
+                "movables": self._movables,
+                "board_blocks": self._board_blocks,
+                "board_rows": self._board_rows,
+                "board_cols": self._board_cols,
+                "target_yaw": self._target_yaw,
+            }
+        )
+
+    def _find_posters(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for obj in self._last_frame_objects:
+            loc = obj.get("place_location") or {}
+            aabb = obj.get("world_aabb") or {}
+            mini = aabb.get("min") or {}
+            maxi = aabb.get("max") or {}
+            if not (mini and maxi):
+                continue
+            x0 = float(mini.get("x", 0.0))
+            x1 = float(maxi.get("x", 0.0))
+            y0 = float(mini.get("y", 0.0))
+            y1 = float(maxi.get("y", 0.0))
+            z0 = float(mini.get("z", 0.0))
+            z1 = float(maxi.get("z", 0.0))
+            xmid = (x0 + x1) / 2.0
+            ymid = (y0 + y1) / 2.0
+            if abs(xmid - 837.0) > 6.0:
+                continue
+            if (y1 - y0) < 40.0 or (z1 - z0) < 40.0 or (x1 - x0) > 8.0:
+                continue
+            if not (45.0 <= ymid <= 150.0):
+                continue
+            if abs(ymid - 166.0) <= 20.0:
+                continue
+            out.append(
+                {
+                    "id": str(obj.get("object_id")),
+                    "x0": x0,
+                    "x1": x1,
+                    "y0": y0,
+                    "y1": y1,
+                    "z0": z0,
+                    "z1": z1,
+                    "area": (y1 - y0) * (z1 - z0),
+                }
+            )
+        out.sort(key=lambda c: -c["area"])
+        return out
+
+    @staticmethod
+    def _gen_grid(panel: dict[str, Any]) -> list[list[float]]:
+        cells: list[list[float]] = []
+        y0 = panel["y0"]
+        y1 = panel["y1"]
+        z0 = panel["z0"]
+        z1 = panel["z1"]
+        n = 3
+        for r in range(n):
+            y = y0 + (r + 0.5) * (y1 - y0) / n
+            for c in range(n):
+                z = z0 + (c + 0.5) * (z1 - z0) / n
+                cells.append([round(y, 1), round(z, 1), r, c])
+        return cells
+
+    def _phase_gen(self) -> dict[str, Any]:
+        g = self._gen
+        stage = g["stage"]
+        if stage == "poster":
+            cells = g["poster_cells"]
+            if g["idx"] >= len(cells):
+                g["stage"] = "filled"
+                g["idx"] = 0
+                return self._ok("poster cells done")
+            y, z, r, c = cells[g["idx"]]
+            g["idx"] += 1
+            self._gen_sample(float(y), float(z), "poster_cell", {"r": int(r), "c": int(c)})
+            return self._ok("poster cell sampled")
+        if stage == "filled":
+            if g["idx"] >= len(self._board_blocks):
+                g["stage"] = "pieces"
+                g["idx"] = 0
+                g["pstep"] = "take"
+                return self._ok("filled cells done")
+            blk = self._board_blocks[g["idx"]]
+            g["idx"] += 1
+            self._gen_sample(float(blk["loc"][0]), float(blk["loc"][1]), "board_filled", {"id": blk["id"]})
+            return self._ok("filled cell sampled")
+        if stage == "pieces":
+            if g["idx"] >= len(self._movables):
+                return self._finish_now("gen recon done")
+            piece = self._movables[g["idx"]]
+            step = g["pstep"]
+            if step == "take":
+                res = self._do_take(piece, "gen_take")
+                self._in_hand = piece
+                g["pstep"] = "put"
+                return self._wrap("gen_take", res)
+            if step == "put":
+                slot = self._empty_slots[0]
+                res = self._do_put(slot, yaw=None, auto_rotate=True, tag="gen_put")
+                g["pstep"] = "sample"
+                return self._wrap("gen_put", res)
+            if step == "sample":
+                slot = self._empty_slots[0]
+                self._gen_sample(float(slot[0]), float(slot[1]), "piece_art", {"piece": piece})
+                g["pstep"] = "undo"
+                return self._ok("piece art sampled")
+            if step == "undo":
+                res = self._do_take(piece, "gen_undo")
+                self._in_hand = piece
+                g["pstep"] = "putback"
+                return self._wrap("gen_undo", res)
+            if step == "putback":
+                spawn = g["spawns"].get(piece)
+                if spawn is not None:
+                    self._put_back(spawn)
+                self._in_hand = None
+                g["idx"] += 1
+                g["pstep"] = "take"
+                return self._ok("piece put back")
+        return self._finish_now("gen unknown stage")
+
+    def _gen_sample(self, y: float, z: float, kind: str, extra: dict[str, Any]) -> None:
+        try:
+            target = {"X": 837.0, "Y": float(y), "Z": float(z)}
+            stand = {"X": 797.0, "Y": float(y), "Z": 60.0}
+            move_res = self._tongsim.move_to_location(self._character_id, stand, stop_distance=1.0)
+            if not self._result_ok(move_res):
+                stand = {"X": self._spawn_loc[0], "Y": self._spawn_loc[1], "Z": self._spawn_loc[2]}
+                self._tongsim.move_to_location(self._character_id, stand, stop_distance=1.0)
+            self._tongsim.look_at_location(self._character_id, target)
+            time.sleep(1.0)
+            perception = self._tongsim.acquire_first_person_perception(self._character_id) or {}
+            stats = self._gen_crop_stats(perception.get("image") or "", kind, extra)
+            self._record(
+                {
+                    "kind": "gen_sample",
+                    "sample_kind": kind,
+                    "y": float(y),
+                    "z": float(z),
+                    "extra": extra,
+                    "stand": stand,
+                    "target": target,
+                    "stats": stats,
+                }
+            )
+        except Exception as exc:
+            logger.warning("gen sample {} {} failed: {}", kind, y, exc)
+
+    def _gen_crop_stats(self, image_b64: str, kind: str, extra: dict[str, Any]) -> dict[str, Any]:
+        if not image_b64:
+            return {"error": "no image"}
+        try:
+            import base64 as b64lib
+            import io as io_lib
+            from PIL import Image as PILImage
+
+            payload = image_b64.split(",", 1)[1] if image_b64.startswith("data:image") else image_b64
+            im = PILImage.open(io_lib.BytesIO(b64lib.b64decode(payload, validate=True))).convert("RGB")
+            w, h = im.size
+            side = max(24, int(min(w, h) * 0.10))
+            cx, cy = w // 2, h // 2
+            crop = im.crop((cx - side, cy - side, cx + side, cy + side))
+            data = list(crop.getdata())
+            n = len(data)
+            mean = [round(sum(p[i] for p in data) / n, 1) for i in range(3)]
+            hists: list[list[float]] = []
+            for ch in range(3):
+                bins = [0] * 16
+                for p in data:
+                    bins[min(15, p[ch] // 16)] += 1
+                hists.append([round(v / n, 4) for v in bins])
+            out: dict[str, Any] = {"mean_rgb": mean, "hist16": hists, "n": n, "crop_side": side, "image_size": [w, h]}
+            log_dir = os.path.join(getattr(self.cfg, "log_dir", "") or "logs", "recon", "crops")
+            os.makedirs(log_dir, exist_ok=True)
+            stamp = datetime.now().strftime("%H%M%S_%f")
+            tag = extra.get("r", extra.get("piece", extra.get("id", "x")))
+            nm = "gen_{}_{}_{}.png".format(kind, tag, stamp)
+            crop.save(os.path.join(log_dir, nm))
+            out["image_path"] = os.path.join(log_dir, nm)
+            return out
+        except Exception as exc:
+            return {"error": str(exc)}
+    # ------------------------------------------------------------------ #
+    # 通用解法数据采集（JIGSAW_GEN_DATA=1）
+    # 单局采集：海报 3x3 格 / 空槽底色 / 板面已放格 / 逐块放空槽后的图案 / 真值放置，
+    # 供离线评估“块图 -> 槽”匹配特征（整格直方图 / 边缘连续 / 海报格对照）。
+    # ------------------------------------------------------------------ #
+
+    def _setup_gen_data(self) -> None:
+        plan: list[dict[str, Any]] = []
+        truth_map: dict[str, list[float]] = dict(self._truth_map)
+        if not truth_map:
+            slots_sorted = sorted([list(s) for s in self._empty_slots], key=lambda s: (s[0], s[1]))
+            for i, bid in enumerate(self._movables):
+                if slots_sorted:
+                    truth_map[bid] = slots_sorted[(i + len(slots_sorted) - 1) % len(slots_sorted)]
+        for piece in self._movables:
+            plan.append({"do": "piece_read", "piece": piece, "slot": list(self._empty_slots[0])})
+        for piece, slot in truth_map.items():
+            if piece in self._movables:
+                plan.append({"do": "truth_place", "piece": piece, "slot": list(slot)})
+        for blk in self._board_blocks:
+            plan.append(
+                {"do": "sample_cell", "kind": "filled", "y": float(blk["loc"][0]), "z": float(blk["loc"][1]), "extra": {"id": blk["id"]}}
+            )
+        for slot in self._empty_slots:
+            plan.append({"do": "sample_cell", "kind": "empty", "y": float(slot[0]), "z": float(slot[1]), "extra": {}})
+        self._record({"kind": "gd_plan", "truth_map": truth_map, "plan": plan})
+        self._gd = {"plan": plan, "i": 0, "sub": "take", "piece": None, "slot": None}
+
+    def _phase_gdata(self) -> dict[str, Any]:
+        g = self._gd
+        plan = g["plan"]
+        if g["i"] >= len(plan):
+            return self._finish_now("gd data run done")
+        item = plan[g["i"]]
+        do = item["do"]
+        if do == "sample_cell":
+            self._gd_sample_cell(float(item["y"]), float(item["z"]), item["kind"], item.get("extra") or {})
+            g["i"] += 1
+            return self._ok("gd cell {} {}".format(item["kind"], g["i"] - 1))
+        if do == "piece_read":
+            return self._gd_piece_item(item, is_truth=False)
+        if do == "truth_place":
+            return self._gd_piece_item(item, is_truth=True)
+        g["i"] += 1
+        return self._ok("gd skip")
+
+    def _gd_piece_item(self, item: dict[str, Any], is_truth: bool) -> dict[str, Any]:
+        g = self._gd
+        piece = item["piece"]
+        slot = item["slot"]
+        sub = g["sub"]
+        if sub == "take":
+            if self._in_hand != piece:
+                res = self._do_take(piece, "gd_take")
+                self._in_hand = piece
+                if not self._result_ok(res):
+                    g["i"] += 1
+                    g["sub"] = "take"
+                    return self._wrap("gd_take", res)
+            g["sub"] = "put"
+            return self._ok("gd take")
+        if sub == "put":
+            res = self._do_put(slot, yaw=None, auto_rotate=True, tag="gd_put")
+            if self._result_ok(res):
+                self._in_hand = None
+                g["sub"] = "sample"
+                return self._wrap("gd_put", res)
+            g["i"] += 1
+            g["sub"] = "take"
+            return self._wrap("gd_put_skip", res)
+        if sub == "sample":
+            self._gd_sample_cell(float(slot[0]), float(slot[1]), "truth" if is_truth else "piece", {"piece": piece})
+            if is_truth:
+                self._mark_placed(piece, slot)
+                g["i"] += 1
+                g["sub"] = "take"
+                return self._ok("gd truth done")
+            g["sub"] = "undo"
+            return self._ok("gd piece sampled")
+        if sub == "undo":
+            res = self._do_take(piece, "gd_undo")
+            self._in_hand = piece
+            if self._result_ok(res):
+                g["sub"] = "putback"
+                return self._wrap("gd_undo", res)
+            g["i"] += 1
+            g["sub"] = "take"
+            return self._wrap("gd_undo_skip", res)
+        if sub == "putback":
+            spawn = self._probe_movable_loc(piece)
+            if spawn is not None:
+                self._put_back(spawn)
+            self._in_hand = None
+            g["i"] += 1
+            g["sub"] = "take"
+            return self._ok("gd piece restored")
+        g["i"] += 1
+        return self._ok("gd advance")
+
+    def _gd_sample_cell(self, y: float, z: float, kind: str, extra: dict[str, Any]) -> dict[str, Any]:
+        target = {"X": 837.0, "Y": float(y), "Z": float(z)}
+        stand_close = {"X": 797.0, "Y": float(y), "Z": 60.0}
+        stand_used = dict(stand_close)
+        try:
+            move_res = self._tongsim.move_to_location(self._character_id, stand_close, stop_distance=1.0)
+            if not self._result_ok(move_res):
+                stand_used = {"X": self._spawn_loc[0], "Y": self._spawn_loc[1], "Z": self._spawn_loc[2]}
+                self._tongsim.move_to_location(self._character_id, stand_used, stop_distance=1.0)
+        except Exception as exc:
+            logger.warning("gd move failed: {}", exc)
+        try:
+            self._tongsim.look_at_location(self._character_id, target)
+        except Exception as exc:
+            logger.warning("gd look failed: {}", exc)
+        time.sleep(1.0)
+        perception = self._tongsim.acquire_first_person_perception(self._character_id) or {}
+        image_b64 = perception.get("image") or ""
+        stats: dict[str, Any] = {"stand_used": stand_used, "stand_close_ok": stand_used == stand_close}
+        if image_b64:
+            tag = str(extra.get("piece", extra.get("id", extra.get("r", "x"))))
+            stats["frame_path"] = self._save_image(image_b64, "gd_{}_{}_{}_{}".format(kind, tag, int(y), int(z)))
+            crop_stats = self._gd_crop_stats(image_b64, kind, extra, float(y), float(z))
+            stats.update(crop_stats)
+        self._record({"kind": "gd_sample", "sample_kind": kind, "y": float(y), "z": float(z), "extra": extra, "target": target, "stats": stats})
+        return stats
+
+    def _gd_crop_stats(self, image_b64: str, kind: str, extra: dict[str, Any], y: float, z: float) -> dict[str, Any]:
+        try:
+            import io as io_lib
+            from PIL import Image as PILImage
+
+            payload = image_b64.split(",", 1)[1] if image_b64.startswith("data:image") else image_b64
+            im = PILImage.open(io_lib.BytesIO(base64.b64decode(payload, validate=True))).convert("RGB")
+            w, h = im.size
+            side = max(24, min(int(h * 0.12), int(w * 0.08)))
+            cx, cy = w // 2, h // 2
+            crop = im.crop((cx - side, cy - side, cx + side, cy + side))
+            log_dir = os.path.join(getattr(self.cfg, "log_dir", "") or "logs", "recon", "crops")
+            os.makedirs(log_dir, exist_ok=True)
+            stamp = datetime.now().strftime("%H%M%S_%f")
+            tag = str(extra.get("piece", extra.get("id", extra.get("r", "x"))))
+            nm = "gd_{}_{}_{}_{}_{}.png".format(kind, tag, int(y), int(z), stamp)
+            crop.save(os.path.join(log_dir, nm))
+            data = list(crop.getdata())
+            n = len(data)
+            mean = [round(sum(p[i] for p in data) / n, 1) for i in range(3)]
+            std = [round((sum((p[i] - mean[i]) ** 2 for p in data) / n) ** 0.5, 1) for i in range(3)]
+            hists: list[list[float]] = []
+            for ch in range(3):
+                bins = [0] * 16
+                for p in data:
+                    bins[min(15, p[ch] // 16)] += 1
+                hists.append([round(v / n, 4) for v in bins])
+            return {
+                "crop_path": os.path.join(log_dir, nm),
+                "image_size": [w, h],
+                "crop_side": side,
+                "mean_rgb": mean,
+                "std_rgb": std,
+                "hist16": hists,
+                "n": n,
+            }
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def _setup_poster_scan(self) -> None:
+        posters = self._find_posters()
+        picked = None
+        for cand in posters:
+            if picked is None or cand["area"] > picked["area"]:
+                picked = cand
+        cells: list[list[float]] = []
+        if picked is not None:
+            for y, z, r, c in self._gen_grid(picked):
+                cells.append([float(y), float(z), float(r), float(c)])
+        self._record({"kind": "poster_plan", "picked": picked, "cells": cells})
+        self._gd = {"cells": cells, "i": 0, "standing": False, "stand": None}
+
+    def _phase_poster2(self) -> dict[str, Any]:
+        g = self._gd
+        cells = g["cells"]
+        if g["i"] >= len(cells):
+            return self._finish_now("poster scan done")
+        if not g["standing"]:
+            cands = [
+                {"X": 797.0, "Y": 105.0, "Z": 60.0},
+                {"X": 797.0, "Y": 166.0, "Z": 60.0},
+                {"X": self._spawn_loc[0], "Y": self._spawn_loc[1], "Z": self._spawn_loc[2]},
+            ]
+            for stand in cands:
+                try:
+                    res = self._tongsim.move_to_location(self._character_id, stand, stop_distance=1.0)
+                except Exception as exc:
+                    res = {"result": "failed", "error": str(exc)}
+                if self._result_ok(res):
+                    g["stand"] = stand
+                    break
+            g["standing"] = True
+            self._record({"kind": "poster_stand", "stand": g["stand"]})
+            return self._ok("poster stand ok")
+        y, z, r, c = cells[g["i"]]
+        target = {"X": 837.0, "Y": float(y), "Z": float(z)}
+        try:
+            self._tongsim.look_at_location(self._character_id, target)
+        except Exception as exc:
+            logger.warning("poster look failed: {}", exc)
+        time.sleep(1.0)
+        perception = self._tongsim.acquire_first_person_perception(self._character_id) or {}
+        image_b64 = perception.get("image") or ""
+        stats: dict[str, Any] = {"stand": g["stand"]}
+        if image_b64:
+            stats["frame_path"] = self._save_image(image_b64, "poster_cell_{}_{}_{}_{}".format(int(r), int(c), int(y), int(z)))
+            crop = self._gd_crop_stats(image_b64, "poster_ref", {"r": int(r), "c": int(c)}, float(y), float(z))
+            stats.update(crop)
+        self._record({"kind": "poster_cell_sample", "r": int(r), "c": int(c), "y": float(y), "z": float(z), "stats": stats})
+        g["i"] += 1
+        return self._ok("poster cell {}.{}".format(int(r), int(c)))
 
     def _lookback(self, tag: str, target: list[float] | None = None) -> dict[str, Any]:
         """回到出生观察点面向板面，全量抓一帧，确认块是否锁定/弹回。"""
