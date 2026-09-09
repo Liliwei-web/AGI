@@ -84,6 +84,9 @@ class JigsawProbeAgent(AgentBase):
         self._score_piece_sigs: dict[str, dict[str, Any]] = {}
         self._score_assign: list[tuple[str, list[float]]] = []
         self._score_place_idx = 0
+        self._eval_run = os.environ.get("PROBE_EVAL", "").strip().lower() in ("1", "true", "yes")
+        self._eval_spec: list[tuple[str, float, float, float | None]] = []
+        self._eval_idx = 0
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -161,6 +164,11 @@ class JigsawProbeAgent(AgentBase):
         if not ok:
             logger.warning("layout analysis failed, finishing without actions")
             return self._finish_now("layout analysis failed")
+        if self._eval_run:
+            self._eval_spec = self._parse_eval_spec(os.environ.get("PROBE_EVAL_PLACES", ""))
+            self._record({"kind": "eval_plan", "movables": self._movables, "empty_slots": self._empty_slots, "spec": self._eval_spec})
+            self._state = "eval"
+            return self._ok("eval start")
         if self._scan_only:
             # 侦察模式：只在原图分辨率下抓若干视角，不做任何取放
             self._record({"kind": "scan_mode", "phase": self._state, "note": "PROBE_SCAN_ONLY, native acquire"})
@@ -424,6 +432,47 @@ class JigsawProbeAgent(AgentBase):
     # ------------------------------------------------------------------ #
     # 确定性贪心控制器（读色-指派-放置）
     # ------------------------------------------------------------------ #
+
+    def _parse_eval_spec(self, raw: str) -> list[tuple[str, float, float, float | None]]:
+        out: list[tuple[str, float, float, float | None]] = []
+        for part in raw.split(';'):
+            part = part.strip()
+            if not part:
+                continue
+            if '@' in part:
+                pid, loc = part.split('@', 1)
+            else:
+                pid = part.split(':')[0].strip()
+                loc = part.split(':', 1)[1] if ':' in part else ''
+            seg = [x.strip() for x in loc.replace('(', '').replace(')', '').split(',') if x.strip()]
+            if len(seg) < 2:
+                continue
+            y = float(seg[0])
+            z = float(seg[1])
+            yaw = float(seg[2]) if len(seg) > 2 else None
+            out.append((str(pid).strip(), y, z, yaw))
+        return out
+
+    def _phase_eval(self) -> dict[str, Any]:
+        if self._eval_idx >= len(self._eval_spec):
+            summary = {"placed": {k: list(v) for k, v in self._placed.items()}}
+            text = 'eval_done placed=' + json.dumps(summary.get('placed', {}), ensure_ascii=False)
+            return self._finish_now('eval done')
+        piece, yy, zz, yaw_opt = self._eval_spec[self._eval_idx]
+        if self._in_hand != piece:
+            result = self._do_take(piece, 'eval_take')
+            self._in_hand = piece
+            if not self._result_ok(result):
+                return self._wrap('eval_take', result)
+            return self._ok('eval take')
+        yaw = yaw_opt if yaw_opt is not None else self._target_yaw
+        slot = [yy, zz]
+        result = self._do_put(slot, yaw=yaw, auto_rotate=False, tag='eval_put')
+        if self._result_ok(result):
+            self._in_hand = None
+            self._mark_placed(piece, slot)
+        self._eval_idx += 1
+        return self._wrap('eval_put', result)
 
     def _build_score_plan(self) -> None:
         cells: list[dict[str, Any]] = []
