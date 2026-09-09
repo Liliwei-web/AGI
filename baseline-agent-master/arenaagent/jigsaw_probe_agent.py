@@ -1443,20 +1443,37 @@ class JigsawProbeAgent(AgentBase):
         self._record({"kind": "layout_yaw", "yaw_counter": dict(yaw_counter), "target_yaw": self._target_yaw})
 
         # 区分板面已放块（Y 行 155/166/177 附近的 6 块）与待放块（出生行 Y~209）
-        board_rows = sorted({round(b["loc"][0], 1) for b in blocks if abs(b["loc"][0] - 209.0) > 5.0})
-        spawn_row = sorted({round(b["loc"][0], 1) for b in blocks if abs(b["loc"][0] - 209.0) <= 5.0})
-        if len(spawn_row) != 1 or len(board_rows) != 3:
-            self._record({"kind": "analysis_failed", "board_rows": board_rows, "spawn_row": spawn_row, "blocks": blocks})
+        spawn_rows = sorted({round(b["loc"][0], 1) for b in blocks if abs(b["loc"][0] - 209.0) <= 5.0})
+        if len(spawn_rows) != 1:
+            self._record({"kind": "analysis_failed", "spawn_rows": spawn_rows, "blocks": blocks})
             return False
-        board_blocks = [b for b in blocks if abs(b["loc"][0] - spawn_row[0]) > 5.0]
-        movable_blocks = sorted([b for b in blocks if abs(b["loc"][0] - spawn_row[0]) <= 5.0], key=lambda b: b["loc"][1])
+        spawn_row = spawn_rows[0]
+        board_blocks = [b for b in blocks if abs(b["loc"][0] - spawn_row) > 5.0]
+        movable_blocks = sorted([b for b in blocks if abs(b["loc"][0] - spawn_row) <= 5.0], key=lambda b: b["loc"][1])
         if len(board_blocks) != 6 or len(movable_blocks) != 3:
             self._record({"kind": "analysis_failed", "board_blocks": board_blocks, "movable_blocks": movable_blocks})
             return False
 
-        cols = sorted({round(b["loc"][1], 1) for b in board_blocks})
-        if len(cols) != 3:
-            self._record({"kind": "analysis_failed", "board_blocks": board_blocks, "cols": cols})
+        def _complete3(vals: list[float], prefer: list[float]) -> list[float] | None:
+            vals = sorted(set(round(float(v), 1) for v in vals))
+            if len(vals) == 3:
+                return vals
+            if len(vals) == 2:
+                d = round(vals[1] - vals[0], 1)
+                if abs(d - 22.0) < 0.51:
+                    return [vals[0], round((vals[0] + vals[1]) / 2.0, 1), vals[1]]
+                if abs(d - 11.0) < 0.51:
+                    cands = [round(vals[0] - 11.0, 1), round(vals[1] + 11.0, 1)]
+                    for cand in prefer:
+                        if cand in cands:
+                            return sorted(vals + [cand])
+                    return None
+            return None
+
+        board_rows = _complete3([b["loc"][0] for b in board_blocks], [155.0, 166.0, 177.0])
+        cols = _complete3([b["loc"][1] for b in board_blocks], [88.0, 99.0, 110.0])
+        if board_rows is None or cols is None:
+            self._record({"kind": "analysis_failed", "board_blocks": board_blocks, "board_rows": board_rows, "cols": cols})
             return False
         filled_cells = {(round(b["loc"][0], 1), round(b["loc"][1], 1)) for b in board_blocks}
         empty_slots = []
@@ -1465,16 +1482,33 @@ class JigsawProbeAgent(AgentBase):
                 if (round(row, 1), round(col, 1)) not in filled_cells:
                     empty_slots.append([row, col])
         empty_slots.sort(key=lambda c: (c[0], c[1]))
+        if len(empty_slots) != 3:
+            self._record({"kind": "analysis_failed", "board_blocks": board_blocks, "board_rows": board_rows, "cols": cols, "empty_slots": empty_slots})
+            return False
 
         self._movables = [b["id"] for b in movable_blocks]
         self._board_blocks = board_blocks
         self._empty_slots = empty_slots
         self._board_rows = board_rows
         self._board_cols = cols
-        self._spawn_row = spawn_row[0]
+        self._spawn_row = spawn_row
         self._last_placed_block = None
         self._placed_target_of_last_put = None
         self._last_auto_slot = None
+        self._record(
+            {
+                "kind": "subject_signature",
+                "signature": {
+                    "rows": board_rows,
+                    "cols": cols,
+                    "empty_slots": empty_slots,
+                    "anchors": sorted([b["id"] for b in board_blocks]),
+                    "anchor_cells": sorted([[round(b["loc"][0], 1), round(b["loc"][1], 1)] for b in board_blocks]),
+                    "movables": list(self._movables),
+                    "target_yaw": self._target_yaw,
+                },
+            }
+        )
         logger.info(
             "layout: movables={} empty_slots={} board_rows={} cols={} target_yaw={}",
             self._movables,
