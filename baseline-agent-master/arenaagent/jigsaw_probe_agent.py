@@ -77,6 +77,13 @@ class JigsawProbeAgent(AgentBase):
         self._place_phase = "pre"
         self._place_piece: str | None = None
         self._place_slot: list[float] | None = None
+        self._score_scan = os.environ.get("PROBE_SCORE", "").strip().lower() in ("1", "true", "yes")
+        self._score_phase = "prescan"
+        self._score_cells: list[dict[str, Any]] = []
+        self._score_cell_sigs: dict[tuple[float, float], dict[str, Any]] = {}
+        self._score_piece_sigs: dict[str, dict[str, Any]] = {}
+        self._score_assign: list[tuple[str, list[float]]] = []
+        self._score_place_idx = 0
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -174,6 +181,11 @@ class JigsawProbeAgent(AgentBase):
             self._record({"kind": "place_scan", "phase": self._state, "piece": self._place_piece, "slot": self._place_slot})
             self._state = "place"
             return self._ok("place scan start")
+        if self._score_scan:
+            self._build_score_plan()
+            self._record({"kind": "score_scan", "phase": self._state, "prescan_cells": self._score_cells})
+            self._state = "score"
+            return self._ok("score scan start")
         self._record(
             {
                 "kind": "plan",
@@ -408,6 +420,172 @@ class JigsawProbeAgent(AgentBase):
             self._in_hand = None
             return self._finish_now("place scan done")
         return self._finish_now("place scan done")
+
+    # ------------------------------------------------------------------ #
+    # 确定性贪心控制器（读色-指派-放置）
+    # ------------------------------------------------------------------ #
+
+    def _build_score_plan(self) -> None:
+        cells: list[dict[str, Any]] = []
+        # 预采样：空槽的相邻已放块（上/下/左/右），用作该槽“期望色”的来源
+        loc_by_id = {b["id"]: (b["loc"][0], b["loc"][1]) for b in self._board_blocks}
+        needed: set[tuple[float, float]] = set()
+        rows = sorted(self._board_rows)
+        cols = sorted(self._board_cols)
+        for slot in self._empty_slots:
+            r, c = slot
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nb = (round(r + dr * 11.0, 1), round(c + dc * 11.0, 1))
+                if nb[0] in rows and nb[1] in cols:
+                    needed.add(nb)
+        for bid, (y, z) in loc_by_id.items():
+            if (round(y, 1), round(z, 1)) in needed:
+                cells.append({"kind": "filled_ctx", "object_id": bid, "y": y, "z": z, "loc": [y, z]})
+        self._score_cells = cells
+
+    def _phase_score(self) -> dict[str, Any]:
+        # 阶段一：采样相邻已放块
+        if self._score_phase == "prescan":
+            if self._score_cells:
+                cell = self._score_cells.pop(0)
+                stats = self._sample_cell_color(cell)
+                if stats:
+                    self._score_cell_sigs[(round(float(cell["y"]), 1), round(float(cell["z"]), 1))] = stats
+                return self._ok("prescan cell")
+            self._score_phase = "reads"
+            self._score_read_pieces = list(self._movables)
+            return self._ok("prescan done")
+        # 阶段二：逐块装到首个空槽读取其正面图案，随后放回
+        if self._score_phase == "reads":
+            if not getattr(self, "_score_read_pieces", []):
+                self._score_phase = "assign"
+                return self._ok("reads done")
+            piece = self._score_read_pieces[0]
+            if getattr(self, "_score_read_step", "take") == "take":
+                self._in_hand = piece
+                self._do_take(piece, "score_read_take")
+                self._score_read_step = "put"
+                return self._ok("read take")
+            if self._score_read_step == "put":
+                slot0 = self._empty_slots[0]
+                self._do_put(slot0, yaw=self._target_yaw, auto_rotate=False, tag="score_read_put")
+                self._score_read_step = "sample"
+                return self._ok("read put")
+            if self._score_read_step == "sample":
+                slot0 = self._empty_slots[0]
+                stats = self._sample_cell_color(
+                    {"kind": "read_sig", "object_id": piece, "y": slot0[0], "z": slot0[1], "loc": list(slot0)}
+                )
+                if stats:
+                    self._score_piece_sigs[piece] = stats
+                self._score_read_step = "undo"
+                return self._ok("read sample")
+            if self._score_read_step == "undo":
+                self._do_take(piece, "score_read_undo")
+                self._in_hand = piece
+                self._score_read_step = "putback"
+                return self._ok("read undo")
+            if self._score_read_step == "putback":
+                target = self._probe_movable_loc(piece)
+                self._put_back(target) if target is not None else None
+                self._in_hand = None
+                self._score_read_pieces.pop(0)
+                self._score_read_step = "take"
+                return self._ok("read putback")
+            return self._ok("reads loop")
+        # 阶段三：根据期望色做指派
+        if self._score_phase == "assign":
+            self._score_assign = self._assign_pieces()
+            self._record({"kind": "score_assign", "piece_sigs_keys": list(self._score_piece_sigs), "assign": self._score_assign})
+            self._score_phase = "place"
+            self._score_place_idx = 0
+            return self._ok("assign done")
+        # 阶段四：按指派逐个放置
+        if self._score_phase == "place":
+            if self._score_place_idx >= len(self._score_assign):
+                return self._finish_now("score controller done")
+            piece, slot = self._score_assign[self._score_place_idx]
+            if self._in_hand != piece:
+                result = self._do_take(piece, "score_place_take")
+                self._in_hand = piece
+                if not self._result_ok(result):
+                    return self._wrap("score_place_take", result)
+                return self._ok("score take")
+            result = self._do_put(slot, yaw=self._target_yaw, auto_rotate=False, tag="score_place_put")
+            if self._result_ok(result):
+                self._in_hand = None
+                self._score_place_idx += 1
+            return self._wrap("score_place_put", result)
+        return self._finish_now("score unknown phase")
+
+    def _sample_cell_color(self, cell: dict[str, Any]) -> dict[str, Any]:
+        """采样单格颜色（与 _phase_score 联动：移动+对准+裁中心+直方图）。"""
+        stats: dict[str, Any] = {}
+        try:
+            if cell.get("kind") == "movable":
+                target = self._probe_movable_loc(cell.get("object_id", ""))
+            else:
+                target = {"X": 837.0, "Y": float(cell["y"]), "Z": float(cell["z"])}
+            if target is None:
+                return {}
+            stand = {"X": 797.0, "Y": float(target["Y"]), "Z": 60.0}
+            move_res = self._tongsim.move_to_location(self._character_id, stand, stop_distance=1.0)
+            if not self._result_ok(move_res):
+                stand = {"X": self._spawn_loc[0], "Y": self._spawn_loc[1], "Z": self._spawn_loc[2]}
+                self._tongsim.move_to_location(self._character_id, stand, stop_distance=1.0)
+            self._tongsim.look_at_location(self._character_id, target)
+            time.sleep(1.2)
+            perception = self._tongsim.acquire_first_person_perception(self._character_id) or {}
+            stats = self._crop_center_stats(perception.get("image") or "", cell)
+        except Exception as exc:
+            logger.warning("color sample {} failed: {}", cell, exc)
+        return stats
+
+    def _assign_pieces(self) -> list[tuple[str, list[float]]]:
+        """把每块正面图案与各槽期望色（相邻已放块均值）做稀疏余弦匹配，暴力枚举 3! 取全局最优。"""
+        slots = [list(s) for s in self._empty_slots]
+        piece_ids = list(self._score_piece_sigs)
+        if not slots or len(piece_ids) != 3:
+            # 兜底：按槽位顺序与块顺序依次放
+            return list(zip(self._movables, slots))
+
+        def hist_vec(stats: dict[str, Any]) -> dict[int, float]:
+            out: dict[int, float] = {}
+            for entry in stats.get("hist", []):
+                idx, share = entry
+                out[int(idx)] = float(share)
+            return out
+
+        def expect_vec(slot: list[float]) -> dict[int, float]:
+            rows = sorted(self._board_rows)
+            cols = sorted(self._board_cols)
+            sigs: list[dict[int, float]] = []
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nb = (round(slot[0] + dr * 11.0, 1), round(slot[1] + dc * 11.0, 1))
+                if nb[0] in rows and nb[1] in cols and nb in self._score_cell_sigs:
+                    sigs.append(hist_vec(self._score_cell_sigs[nb]))
+            merged: dict[int, float] = {}
+            for vec in sigs:
+                for idx, share in vec.items():
+                    merged[idx] = merged.get(idx, 0.0) + share / max(len(sigs), 1)
+            return merged
+
+        def cos(a: dict[int, float], b: dict[int, float]) -> float:
+            keys = set(a) | set(b)
+            dot = sum(a.get(k, 0.0) * b.get(k, 0.0) for k in keys)
+            na = sum(v * v for v in a.values()) ** 0.5
+            nb = sum(v * v for v in b.values()) ** 0.5
+            return dot / (na * nb) if na and nb else 0.0
+
+        expects = [expect_vec(s) for s in slots]
+        best: tuple[float, list[tuple[str, list[float]]]] = (-1.0, [])
+        import itertools
+
+        for perm in itertools.permutations(piece_ids):
+            score = sum(cos(hist_vec(self._score_piece_sigs[p]), expects[i]) for i, p in enumerate(perm))
+            if score > best[0]:
+                best = (score, [(p, slots[i]) for i, p in enumerate(perm)])
+        return best[1] if best[1] else list(zip(piece_ids, slots))
 
     def _put_back(self, target: dict[str, float]) -> dict[str, Any]:
         rotation = Rotation(roll=0.0, yaw=float(self._target_yaw or 0.0), pitch=0.0)
