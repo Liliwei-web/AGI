@@ -85,7 +85,7 @@ class JigsawProbeAgent(AgentBase):
         self._score_assign: list[tuple[str, list[float]]] = []
         self._score_place_idx = 0
         self._eval_run = os.environ.get("PROBE_EVAL", "").strip().lower() in ("1", "true", "yes")
-        self._eval_spec: list[tuple[str, float, float, float | None]] = []
+        self._eval_spec: list[tuple[str, float, float, float | str | None]] = []
         self._eval_idx = 0
         self._solve_run = os.environ.get("SOLVE", "").strip().lower() in ("1", "true", "yes")
         self._capture_after = os.environ.get("CAPTURE_AFTER", "").strip().lower() in ("1", "true", "yes")
@@ -486,6 +486,8 @@ class JigsawProbeAgent(AgentBase):
                     yaw = (self._target_yaw or 0.0) + float(tok)
                 else:
                     yaw = float(tok)
+            elif len(seg) > 2 and seg[2] == 'auto':
+                yaw = 'auto'
             out.append((str(pid).strip(), y, z, yaw))
         return out
 
@@ -510,9 +512,14 @@ class JigsawProbeAgent(AgentBase):
             if not self._result_ok(result):
                 return self._wrap('eval_take', result)
             return self._ok('eval take')
-        yaw = yaw_opt if yaw_opt is not None else self._target_yaw
+        if yaw_opt == 'auto':
+            yaw = None
+            auto_rotate = True
+        else:
+            yaw = yaw_opt if yaw_opt is not None else self._target_yaw
+            auto_rotate = False
         slot = [yy, zz]
-        result = self._do_put(slot, yaw=yaw, auto_rotate=False, tag='eval_put')
+        result = self._do_put(slot, yaw=yaw, auto_rotate=auto_rotate, tag='eval_put')
         if self._result_ok(result):
             self._in_hand = None
             self._mark_placed(piece, slot)
