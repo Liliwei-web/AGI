@@ -113,6 +113,9 @@ class JigsawProbeAgent(AgentBase):
         self._undo_slot: list[float] | None = None
         self._arr_run = os.environ.get("JIGSAW_ARR", "").strip().lower() in ("1", "true", "yes")
         self._arr_phase = "wrong"
+        self._aim_run = os.environ.get("JIGSAW_AIM", "").strip().lower() in ("1", "true", "yes")
+        self._aim_idx = 0
+        self._aim_steps: list[dict[str, Any]] = []
         self._arr_wrong: list[list[Any]] = []
         self._arr_right: dict[str, list[float]] = {}
         self._arr_idx = 0
@@ -239,6 +242,17 @@ class JigsawProbeAgent(AgentBase):
             self._setup_arr()
             self._state = "arr"
             return self._ok("arrangement swap start")
+        if self._aim_run:
+            self._aim_steps = [
+                {"tag": "aim_a1_move_lookloc", "stand": {"X": 797.0, "Y": 166.0, "Z": 60.0}, "method": "loc", "target": self._board_center()},
+                {"tag": "aim_a2_lookobj_mid", "stand": None, "method": "obj", "target": str(self._board_blocks[0]["id"])},
+                {"tag": "aim_a3_lookloc_again", "stand": None, "method": "loc", "target": self._board_center()},
+                {"tag": "aim_a4_lookobj_mid2", "stand": None, "method": "obj", "target": str(self._board_blocks[-1]["id"])},
+                {"tag": "aim_a5_spawn_lookloc", "stand": {"X": float(self._spawn_loc[0]), "Y": float(self._spawn_loc[1]), "Z": float(self._spawn_loc[2])}, "method": "loc", "target": self._board_center()},
+            ]
+            self._record({"kind": "aim_plan", "steps": self._aim_steps, "spawn": self._spawn_loc})
+            self._state = "aim"
+            return self._ok("aim probe start")
 
         if self._scan_only:
             # 侦察模式：只在原图分辨率下抓若干视角，不做任何取放
@@ -577,6 +591,33 @@ class JigsawProbeAgent(AgentBase):
         self._record({"kind": "hand", "phase": phase, "has_object_in_hand": bool(has_obj), "hand_idx": hand_idx})
         return bool(has_obj)
 
+    def _phase_aim(self) -> dict[str, Any]:
+        if self._aim_idx >= len(self._aim_steps):
+            return self._finish_now("aim probe done")
+        step = self._aim_steps[self._aim_idx]
+        meta: dict[str, Any] = {"stand": step.get("stand"), "method": step.get("method"), "target": step.get("target")}
+        if step.get("stand"):
+            try:
+                meta["move"] = self._tongsim.move_to_location(self._character_id, step["stand"], stop_distance=1.0)
+            except Exception as exc:
+                meta["move_error"] = str(exc)
+        try:
+            if step["method"] == "obj":
+                meta["look"] = self._tongsim.look_at_object(self._character_id, str(step["target"]))
+            else:
+                meta["look"] = self._tongsim.look_at_location(self._character_id, step["target"])
+        except Exception as exc:
+            meta["look_error"] = str(exc)
+        time.sleep(1.5)
+        frame = self._acquire_native(step["tag"], save_image=True)
+        meta["visible_count"] = len(frame.get("objects", []))
+        ids = [str(o.get("object_id")) for o in frame.get("objects", [])]
+        meta["board_tiles_visible"] = [b["id"] for b in self._board_blocks if b["id"] in ids]
+        meta["image_path"] = frame.get("image_path")
+        self._record({"kind": "aim_shot", "tag": step["tag"], "meta": meta})
+        self._aim_idx += 1
+        return self._ok("aim shot " + step["tag"])
+
     def _acquire_native(self, tag: str, save_image: bool = False) -> dict[str, Any]:
         """原生比例抓帧（1440x1000 左右）。带 width/height 会返回 2560x720 全景，板面会严重畸变。"""
         try:
@@ -602,26 +643,51 @@ class JigsawProbeAgent(AgentBase):
         )
         return {"objects": objects, "image_path": image_path}
 
-    def _close_shot(self, tag: str, stand_y: float, look_slot: list[float] | None = None) -> dict[str, Any]:
-        """站到 (797, stand_y, 60) 近距看板面并落盘一帧（沿用 _sample_cell_color 的站位）。"""
+    def _close_shot(
+        self,
+        tag: str,
+        stand_y: float,
+        look_slot: list[float] | None = None,
+        require_tiles: int = 6,
+    ) -> dict[str, Any]:
+        """近距看板：先回出生点再站位（放完块后直接站位导航不干净），瞄准后抓帧并校验板面块可见数。"""
         meta: dict[str, Any] = {}
         target = self._slot_loc(look_slot) if look_slot else self._board_center()
         stand = {"X": 797.0, "Y": float(stand_y), "Z": 60.0}
-        try:
-            meta["move"] = self._tongsim.move_to_location(self._character_id, stand, stop_distance=1.0)
-        except Exception as exc:
-            meta["move_error"] = str(exc)
-        try:
-            meta["look"] = self._tongsim.look_at_location(self._character_id, target)
-        except Exception as exc:
-            meta["look_error"] = str(exc)
-        time.sleep(1.2)
-        frame = self._acquire_native(tag, save_image=True)
-        meta["visible_count"] = len(frame.get("objects", []))
+        spawn = {"X": float(self._spawn_loc[0]), "Y": float(self._spawn_loc[1]), "Z": float(self._spawn_loc[2])}
+        board_ids = {str(b["id"]) for b in self._board_blocks}
+        frame: dict[str, Any] = {}
+        attempts: list[dict[str, Any]] = []
+        for attempt in range(2):
+            info: dict[str, Any] = {}
+            try:
+                info["spawn_move"] = self._tongsim.move_to_location(self._character_id, spawn, stop_distance=1.0)
+            except Exception as exc:
+                info["spawn_move_error"] = str(exc)
+            try:
+                info["stand_move"] = self._tongsim.move_to_location(self._character_id, stand, stop_distance=1.0)
+            except Exception as exc:
+                info["stand_move_error"] = str(exc)
+            try:
+                info["look"] = self._tongsim.look_at_location(self._character_id, target)
+            except Exception as exc:
+                info["look_error"] = str(exc)
+            time.sleep(1.5)
+            frame = self._acquire_native(tag, save_image=True)
+            ids = {str(o.get("object_id")) for o in frame.get("objects", [])}
+            visible = sorted(board_ids & ids)
+            info["board_tiles_visible"] = visible
+            info["visible_count"] = len(ids)
+            attempts.append(info)
+            if len(visible) >= require_tiles:
+                break
+        meta["attempts"] = attempts
         meta["stand"] = stand
-        obs = {"frame": frame, "meta": meta}
-        self._record_observation(tag, obs)
-        return obs
+        meta["target"] = target
+        meta["image_path"] = frame.get("image_path")
+        meta["board_tiles_visible"] = attempts[-1].get("board_tiles_visible") if attempts else []
+        self._record({"kind": "close_shot", "tag": tag, "meta": meta})
+        return {"frame": frame, "meta": meta}
 
     def _phase_undo_probe(self) -> dict[str, Any]:
         if self._undo_piece is None or self._undo_slot is None:
