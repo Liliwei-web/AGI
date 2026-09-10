@@ -111,6 +111,11 @@ class JigsawProbeAgent(AgentBase):
         self._undo_phase = "init"
         self._undo_piece: str | None = None
         self._undo_slot: list[float] | None = None
+        self._arr_run = os.environ.get("JIGSAW_ARR", "").strip().lower() in ("1", "true", "yes")
+        self._arr_phase = "wrong"
+        self._arr_wrong: list[list[Any]] = []
+        self._arr_right: dict[str, list[float]] = {}
+        self._arr_idx = 0
 
 
     # ------------------------------------------------------------------ #
@@ -230,6 +235,10 @@ class JigsawProbeAgent(AgentBase):
             )
             self._state = "undo_probe"
             return self._ok("undo probe start")
+        if self._arr_run:
+            self._setup_arr()
+            self._state = "arr"
+            return self._ok("arrangement swap start")
 
         if self._scan_only:
             # 侦察模式：只在原图分辨率下抓若干视角，不做任何取放
@@ -455,6 +464,105 @@ class JigsawProbeAgent(AgentBase):
         return self._ok("face")
 
     # ------------------------------------------------------------------ #
+    # 排列对照实验（JIGSAW_ARR=1）
+    # 先把 3 块按“错排列”放好拍板面照，再原地取回按“正确排列”重放并拍照。
+    # 用途：离线比较两种排列的本地判据（12 条接缝）能否区分。
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _parse_arr_spec(raw: str) -> list[list[Any]]:
+        out: list[list[Any]] = []
+        for part in (raw or "").split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            left, _, right = part.partition(":")
+            coords = [c.strip() for c in right.split(",") if c.strip()]
+            if len(coords) < 2:
+                continue
+            try:
+                out.append([left.strip(), [float(coords[0]), float(coords[1])]])
+            except Exception:
+                continue
+        return out
+
+    def _setup_arr(self) -> None:
+        wrong = self._parse_arr_spec(os.environ.get("JIGSAW_ARR_WRONG", ""))
+        right = self._parse_arr_spec(os.environ.get("JIGSAW_ARR_RIGHT", ""))
+        if len(wrong) != 3 or len(right) != 3:
+            wrong = [[bid, list(self._empty_slots[i])] for i, bid in enumerate(self._movables)]
+            slots = list(reversed([list(s) for s in self._empty_slots]))
+            right = [[bid, slots[i]] for i, bid in enumerate(self._movables)]
+        self._arr_wrong = wrong
+        self._arr_right = {str(p[0]): [float(p[1][0]), float(p[1][1])] for p in right}
+        self._record(
+            {
+                "kind": "arr_plan",
+                "wrong": wrong,
+                "right": right,
+                "movables": self._movables,
+                "empty_slots": self._empty_slots,
+            }
+        )
+        logger.info("arr plan wrong={} right={}", wrong, right)
+
+    def _phase_arr(self) -> dict[str, Any]:
+        phase = self._arr_phase
+        if phase == "wrong":
+            if self._arr_idx >= len(self._arr_wrong):
+                self._arr_phase = "shot_wrong"
+                return self._ok("wrong arrangement placed")
+            piece, slot = self._arr_wrong[self._arr_idx]
+            if self._in_hand != piece:
+                res = self._do_take(piece, "arr_wrong_take")
+                if self._result_ok(res):
+                    self._in_hand = piece
+                return self._wrap("arr_wrong_take", res)
+            res = self._do_put(slot, yaw=None, auto_rotate=True, tag="arr_wrong_put")
+            if self._result_ok(res):
+                self._in_hand = None
+                self._mark_placed(piece, slot)
+                self._arr_idx += 1
+            return self._wrap("arr_wrong_put", res)
+        if phase == "shot_wrong":
+            self._close_shot("arr_wrong_board", 166.0, [166.0, 99.0])
+            self._arr_phase = "correct"
+            self._arr_idx = 0
+            return self._ok("wrong arrangement photographed")
+        if phase == "correct":
+            if self._arr_idx >= len(self._arr_wrong):
+                self._arr_phase = "shot_right"
+                return self._ok("correct arrangement placed")
+            piece, _slot = self._arr_wrong[self._arr_idx]
+            target = self._arr_right.get(str(piece))
+            if target is None:
+                self._arr_idx += 1
+                return self._ok("no target for piece {}".format(piece))
+            if self._in_hand != piece:
+                res = self._do_take(piece, "arr_move_take")
+                if self._result_ok(res):
+                    self._in_hand = piece
+                    self._release_slot_of(piece)
+                return self._wrap("arr_move_take", res)
+            res = self._do_put(target, yaw=None, auto_rotate=True, tag="arr_move_put")
+            if self._result_ok(res):
+                self._in_hand = None
+                self._mark_placed(piece, target)
+                self._arr_idx += 1
+            return self._wrap("arr_move_put", res)
+        if phase == "shot_right":
+            self._close_shot("arr_right_board", 166.0, [166.0, 99.0])
+            for slot in self._empty_slots:
+                self._close_shot(
+                    "arr_right_cell_{}_{}".format(int(slot[0]), int(slot[1])),
+                    slot[0],
+                    [slot[0], slot[1]],
+                )
+            self._arr_phase = "done"
+            return self._ok("correct arrangement photographed")
+        return self._finish_now("arrangement swap done")
+
+    # ------------------------------------------------------------------ #
     # undo 往返验证（PROBE_UNDO=1）
     # 目的：确认「已放入槽的块」能否被 move_and_take_object 取回手上。
     # 能取回 => 支持两轮放置（先乱放拍照取排列 -> undo 全部 -> 按正确排列重放）。
@@ -468,6 +576,31 @@ class JigsawProbeAgent(AgentBase):
             return None
         self._record({"kind": "hand", "phase": phase, "has_object_in_hand": bool(has_obj), "hand_idx": hand_idx})
         return bool(has_obj)
+
+    def _acquire_native(self, tag: str, save_image: bool = False) -> dict[str, Any]:
+        """原生比例抓帧（1440x1000 左右）。带 width/height 会返回 2560x720 全景，板面会严重畸变。"""
+        try:
+            perception = self._tongsim.acquire_first_person_perception(self._character_id) or {}
+        except Exception as exc:
+            logger.error("native perception failed at {}: {}", tag, exc)
+            perception = {}
+        image_b64 = perception.get("image")
+        image_path = ""
+        if save_image and image_b64:
+            image_path = self._save_image(image_b64, tag)
+        objects = perception.get("objects", []) or []
+        self._last_frame_objects = objects
+        self._record(
+            {
+                "kind": "frame",
+                "phase": tag,
+                "step": self._step_no,
+                "native": True,
+                "image_path": image_path,
+                "objects": objects,
+            }
+        )
+        return {"objects": objects, "image_path": image_path}
 
     def _close_shot(self, tag: str, stand_y: float, look_slot: list[float] | None = None) -> dict[str, Any]:
         """站到 (797, stand_y, 60) 近距看板面并落盘一帧（沿用 _sample_cell_color 的站位）。"""
@@ -483,7 +616,7 @@ class JigsawProbeAgent(AgentBase):
         except Exception as exc:
             meta["look_error"] = str(exc)
         time.sleep(1.2)
-        frame = self._acquire_and_log(tag, save_image=True)
+        frame = self._acquire_native(tag, save_image=True)
         meta["visible_count"] = len(frame.get("objects", []))
         meta["stand"] = stand
         obs = {"frame": frame, "meta": meta}
