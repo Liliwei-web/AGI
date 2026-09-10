@@ -118,6 +118,7 @@ class JigsawProbeAgent(AgentBase):
         self._aim_steps: list[dict[str, Any]] = []
         self._calib_run = os.environ.get("JIGSAW_CALIB", "").strip().lower() in ("1", "true", "yes")
         self._calib_idx = 0
+        self._nav_obj = os.environ.get("JIGSAW_NAVOBJ", "").strip().lower() in ("1", "true", "yes")
         self._arr_wrong: list[list[Any]] = []
         self._arr_right: dict[str, list[float]] = {}
         self._arr_idx = 0
@@ -672,26 +673,55 @@ class JigsawProbeAgent(AgentBase):
         board_ids = {str(b["id"]) for b in self._board_blocks}
         frame: dict[str, Any] = {}
         attempts: list[dict[str, Any]] = []
+        anchor_id = None
+        if self._nav_obj and self._board_blocks:
+            anchor_id = str(
+                min(
+                    self._board_blocks,
+                    key=lambda b: (b["loc"][0] - self._board_center()["Y"]) ** 2
+                    + (b["loc"][1] - self._board_center()["Z"]) ** 2,
+                )["id"]
+            )
         for attempt in range(2):
-            info: dict[str, Any] = {}
-            try:
-                info["spawn_move"] = self._tongsim.move_to_location(self._character_id, spawn, stop_distance=1.0)
-            except Exception as exc:
-                info["spawn_move_error"] = str(exc)
-            try:
-                info["stand_move"] = self._tongsim.move_to_location(self._character_id, stand, stop_distance=1.0)
-            except Exception as exc:
-                info["stand_move_error"] = str(exc)
-            try:
-                info["look"] = self._tongsim.look_at_location(self._character_id, target)
-            except Exception as exc:
-                info["look_error"] = str(exc)
-            time.sleep(1.5)
-            try:
-                info["look2"] = self._tongsim.look_at_location(self._character_id, target)
-            except Exception as exc:
-                info["look2_error"] = str(exc)
-            time.sleep(1.5)
+            info: dict[str, Any] = {"anchor_id": anchor_id}
+            if anchor_id:
+                try:
+                    info["spawn_move"] = self._tongsim.move_to_location(self._character_id, spawn, stop_distance=1.0)
+                except Exception as exc:
+                    info["spawn_move_error"] = str(exc)
+                try:
+                    info["stand_move"] = self._tongsim.move_to_object(self._character_id, anchor_id)
+                except Exception as exc:
+                    info["stand_move_error"] = str(exc)
+                try:
+                    info["look"] = self._tongsim.look_at_object(self._character_id, anchor_id)
+                except Exception as exc:
+                    info["look_error"] = str(exc)
+                time.sleep(1.5)
+                try:
+                    info["look2"] = self._tongsim.look_at_object(self._character_id, anchor_id)
+                except Exception as exc:
+                    info["look2_error"] = str(exc)
+                time.sleep(1.5)
+            else:
+                try:
+                    info["spawn_move"] = self._tongsim.move_to_location(self._character_id, spawn, stop_distance=1.0)
+                except Exception as exc:
+                    info["spawn_move_error"] = str(exc)
+                try:
+                    info["stand_move"] = self._tongsim.move_to_location(self._character_id, stand, stop_distance=1.0)
+                except Exception as exc:
+                    info["stand_move_error"] = str(exc)
+                try:
+                    info["look"] = self._tongsim.look_at_location(self._character_id, target)
+                except Exception as exc:
+                    info["look_error"] = str(exc)
+                time.sleep(1.5)
+                try:
+                    info["look2"] = self._tongsim.look_at_location(self._character_id, target)
+                except Exception as exc:
+                    info["look2_error"] = str(exc)
+                time.sleep(1.5)
             frame = self._acquire_native(tag, save_image=True)
             ids = {str(o.get("object_id")) for o in frame.get("objects", [])}
             visible = sorted(board_ids & ids)
