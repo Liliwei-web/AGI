@@ -683,16 +683,12 @@ class JigsawProbeAgent(AgentBase):
             except Exception as exc:
                 info["stand_move_error"] = str(exc)
             try:
-                info["look"] = self._tongsim.look_at_location(
-                    self._character_id, target, execute_immediately=True
-                )
+                info["look"] = self._tongsim.look_at_location(self._character_id, target)
             except Exception as exc:
                 info["look_error"] = str(exc)
-            time.sleep(1.0)
+            time.sleep(1.5)
             try:
-                info["look2"] = self._tongsim.look_at_location(
-                    self._character_id, target, execute_immediately=True
-                )
+                info["look2"] = self._tongsim.look_at_location(self._character_id, target)
             except Exception as exc:
                 info["look2_error"] = str(exc)
             time.sleep(1.5)
