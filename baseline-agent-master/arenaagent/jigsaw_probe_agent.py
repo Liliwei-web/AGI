@@ -107,6 +107,10 @@ class JigsawProbeAgent(AgentBase):
         self._gd: dict[str, Any] = {}
         self._poster_scan = os.environ.get("JIGSAW_POSTER", "").strip().lower() in ("1", "true", "yes")
         self._pframe = os.environ.get("JIGSAW_PFRAME", "").strip().lower() in ("1", "true", "yes")
+        self._undo_run = os.environ.get("PROBE_UNDO", "").strip().lower() in ("1", "true", "yes")
+        self._undo_phase = "init"
+        self._undo_piece: str | None = None
+        self._undo_slot: list[float] | None = None
 
 
     # ------------------------------------------------------------------ #
@@ -211,6 +215,21 @@ class JigsawProbeAgent(AgentBase):
             self._setup_pframe()
             self._state = "pframe"
             return self._ok("pframe start")
+        if self._undo_run:
+            self._undo_piece = self._movables[0] if self._movables else None
+            self._undo_slot = list(self._empty_slots[0]) if self._empty_slots else None
+            self._record(
+                {
+                    "kind": "undo_probe_plan",
+                    "piece": self._undo_piece,
+                    "slot": self._undo_slot,
+                    "spawn_loc": self._spawn_loc,
+                    "movables": self._movables,
+                    "empty_slots": self._empty_slots,
+                }
+            )
+            self._state = "undo_probe"
+            return self._ok("undo probe start")
 
         if self._scan_only:
             # 侦察模式：只在原图分辨率下抓若干视角，不做任何取放
@@ -434,6 +453,94 @@ class JigsawProbeAgent(AgentBase):
             self._face_phase = "take"
             return self._wrap("face_restore", result)
         return self._ok("face")
+
+    # ------------------------------------------------------------------ #
+    # undo 往返验证（PROBE_UNDO=1）
+    # 目的：确认「已放入槽的块」能否被 move_and_take_object 取回手上。
+    # 能取回 => 支持两轮放置（先乱放拍照取排列 -> undo 全部 -> 按正确排列重放）。
+    # ------------------------------------------------------------------ #
+
+    def _hand_state(self, phase: str) -> bool | None:
+        try:
+            has_obj, hand_idx = self._tongsim.has_object_in_hand(self._character_id)
+        except Exception as exc:
+            self._record({"kind": "hand", "phase": phase, "error": str(exc)})
+            return None
+        self._record({"kind": "hand", "phase": phase, "has_object_in_hand": bool(has_obj), "hand_idx": hand_idx})
+        return bool(has_obj)
+
+    def _close_shot(self, tag: str, stand_y: float, look_slot: list[float] | None = None) -> dict[str, Any]:
+        """站到 (797, stand_y, 60) 近距看板面并落盘一帧（沿用 _sample_cell_color 的站位）。"""
+        meta: dict[str, Any] = {}
+        target = self._slot_loc(look_slot) if look_slot else self._board_center()
+        stand = {"X": 797.0, "Y": float(stand_y), "Z": 60.0}
+        try:
+            meta["move"] = self._tongsim.move_to_location(self._character_id, stand, stop_distance=1.0)
+        except Exception as exc:
+            meta["move_error"] = str(exc)
+        try:
+            meta["look"] = self._tongsim.look_at_location(self._character_id, target)
+        except Exception as exc:
+            meta["look_error"] = str(exc)
+        time.sleep(1.2)
+        frame = self._acquire_and_log(tag, save_image=True)
+        meta["visible_count"] = len(frame.get("objects", []))
+        meta["stand"] = stand
+        obs = {"frame": frame, "meta": meta}
+        self._record_observation(tag, obs)
+        return obs
+
+    def _phase_undo_probe(self) -> dict[str, Any]:
+        if self._undo_piece is None or self._undo_slot is None:
+            return self._finish_now("undo probe missing piece/slot")
+        phase = self._undo_phase
+        if phase == "init":
+            self._hand_state("before_take")
+            self._close_shot("undo_before", self._undo_slot[0], self._undo_slot)
+            self._undo_phase = "take"
+            return self._ok("undo probe: baseline captured")
+        if phase == "take":
+            result = self._do_take(self._undo_piece, "undo_take")
+            self._record({"kind": "undo_step", "step": "take", "piece": self._undo_piece, "result": result})
+            self._undo_phase = "hand_after_take"
+            return self._wrap("undo_take", result)
+        if phase == "hand_after_take":
+            self._hand_state("after_take")
+            self._undo_phase = "put"
+            return self._ok("undo probe: hand state after take")
+        if phase == "put":
+            result = self._do_put(self._undo_slot, yaw=None, auto_rotate=True, tag="undo_put")
+            self._record({"kind": "undo_step", "step": "put", "slot": self._undo_slot, "result": result})
+            self._undo_phase = "hand_after_put"
+            return self._wrap("undo_put", result)
+        if phase == "hand_after_put":
+            self._hand_state("after_put")
+            self._undo_phase = "look_placed"
+            return self._ok("undo probe: hand state after put")
+        if phase == "look_placed":
+            self._close_shot("undo_placed", self._undo_slot[0], self._undo_slot)
+            self._undo_phase = "undo"
+            return self._ok("undo probe: placed frame captured")
+        if phase == "undo":
+            result = self._do_take(self._undo_piece, "undo_undo")
+            self._record({"kind": "undo_step", "step": "undo", "piece": self._undo_piece, "result": result})
+            self._undo_phase = "hand_after_undo"
+            return self._wrap("undo_undo", result)
+        if phase == "hand_after_undo":
+            self._hand_state("after_undo")
+            self._undo_phase = "look_after_undo"
+            return self._ok("undo probe: hand state after undo")
+        if phase == "look_after_undo":
+            self._close_shot("undo_after", self._undo_slot[0], self._undo_slot)
+            self._undo_phase = "restore"
+            return self._ok("undo probe: post-undo frame captured")
+        if phase == "restore":
+            target = self._probe_movable_loc(self._undo_piece)
+            result = self._put_back(target) if target is not None else {"result": "skipped"}
+            self._record({"kind": "undo_step", "step": "restore", "result": result})
+            self._undo_phase = "done"
+            return self._finish_now("undo probe done")
+        return self._finish_now("undo probe done")
 
     def _phase_place(self) -> dict[str, Any]:
         if self._place_piece is None or self._place_slot is None:
