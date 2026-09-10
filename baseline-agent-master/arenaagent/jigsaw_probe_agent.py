@@ -116,6 +116,8 @@ class JigsawProbeAgent(AgentBase):
         self._aim_run = os.environ.get("JIGSAW_AIM", "").strip().lower() in ("1", "true", "yes")
         self._aim_idx = 0
         self._aim_steps: list[dict[str, Any]] = []
+        self._calib_run = os.environ.get("JIGSAW_CALIB", "").strip().lower() in ("1", "true", "yes")
+        self._calib_idx = 0
         self._arr_wrong: list[list[Any]] = []
         self._arr_right: dict[str, list[float]] = {}
         self._arr_idx = 0
@@ -253,6 +255,9 @@ class JigsawProbeAgent(AgentBase):
             self._record({"kind": "aim_plan", "steps": self._aim_steps, "spawn": self._spawn_loc})
             self._state = "aim"
             return self._ok("aim probe start")
+        if self._calib_run:
+            self._state = "calib"
+            return self._ok("calib start")
 
         if self._scan_only:
             # 侦察模式：只在原图分辨率下抓若干视角，不做任何取放
@@ -591,6 +596,15 @@ class JigsawProbeAgent(AgentBase):
         self._record({"kind": "hand", "phase": phase, "has_object_in_hand": bool(has_obj), "hand_idx": hand_idx})
         return bool(has_obj)
 
+    def _phase_calib(self) -> dict[str, Any]:
+        """同一站位重复拍板面照，用于验证取景是否可复现（手工标定像素框的前提）。"""
+        if self._calib_idx >= 5:
+            return self._finish_now("calib done")
+        tag = "calib_{}".format(self._calib_idx)
+        obs = self._close_shot(tag, 166.0, [166.0, 99.0])
+        self._calib_idx += 1
+        return self._ok("calib shot " + str(self._calib_idx))
+
     def _phase_aim(self) -> dict[str, Any]:
         if self._aim_idx >= len(self._aim_steps):
             return self._finish_now("aim probe done")
@@ -669,9 +683,18 @@ class JigsawProbeAgent(AgentBase):
             except Exception as exc:
                 info["stand_move_error"] = str(exc)
             try:
-                info["look"] = self._tongsim.look_at_location(self._character_id, target)
+                info["look"] = self._tongsim.look_at_location(
+                    self._character_id, target, execute_immediately=True
+                )
             except Exception as exc:
                 info["look_error"] = str(exc)
+            time.sleep(1.0)
+            try:
+                info["look2"] = self._tongsim.look_at_location(
+                    self._character_id, target, execute_immediately=True
+                )
+            except Exception as exc:
+                info["look2_error"] = str(exc)
             time.sleep(1.5)
             frame = self._acquire_native(tag, save_image=True)
             ids = {str(o.get("object_id")) for o in frame.get("objects", [])}
