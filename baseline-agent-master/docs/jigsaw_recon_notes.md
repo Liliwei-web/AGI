@@ -190,3 +190,31 @@
 - `_close_shot`：稳定的近距看板照（回出生点 -> 站位 -> 瞄准 -> 校验）。
 - `_do_take` / `_do_put(auto_rotate=True)`：取块 / 自动摆正放置。
 - `move_and_take_object` 对已入槽块 = undo；`has_object_in_hand` 可校验手上状态。
+
+
+## 2026-09-10 晚：VLM 通路确认 + 固定像素框标定被证伪
+
+### 1. DeepSeek 视觉确认（用户提示正确）
+- `api.deepseek.com/v1` 的 `deepseek-flash` **确实支持图片输入**，可用 OpenAI 兼容 block 数组。
+- 但 `image_url` 必须带 `detail` 字段，否则报 `.messages[0]: Unsupported image_url format`：
+  `{"type":"image_url","image_url":{"url":"data:image/png;base64,...","detail":"auto"}}`
+- 实测发红底蓝方图，返回 `content="Two colors are red and blue"`，另有 `reasoning_content` 字段。
+- 结论：VLM 层用 `deepseek-flash` + `api.deepseek.com/v1`，不需要千问。
+- 附注：`/v1/models` 只列 `deepseek-flash` / `deepseek-v4-pro` 两个名字，与多模态能力无关。
+
+### 2. 近距看板取景不可复现（固定像素框方案的前提被证伪）
+三组连拍实验（每组同一站位连拍 5 张，站位 (797,166,60) 瞄板面中心）：
+- 坐标站位 + 动画瞄准：帧间 mean|diff| 12-23，17-34% 像素差异 >15，板面暗块 x 范围在 718-1000 之间漂移。
+- 坐标站位 + `execute_immediately=True`：同样漂移（甚至更差）。
+- 改为 `move_to_object(中场锚点块)` + `look_at_object`：帧间差异降到 8-13，一致性最好，
+  但取景落到了一面空墙上（角色贴到块上后视野里没有板面），不可用。
+- 结论：**同一站位每次到达的实际机位不同（含朝向），跨 run 更不同**，
+  所以"站一次拍一张、手工框 9 格像素坐标永久复用"在当前接口下不成立。
+  实测可用的替代：以世界坐标瞄准"接缝中点"（`look_at_location` 单点瞄准是准的），
+  在中心裁剪里比较过缝两侧的统计量，不需要像素网格。
+
+### 3. 本轮新增的可复用原语
+- `_acquire_native`：原生比例抓帧（1440x1000）。
+- `_close_shot`：回出生点 -> 站位 -> 瞄准 -> 校验板面块可见数（含重试）。
+- `JIGSAW_CALIB=1`：同站位连拍 5 张，用于验证取景一致性。
+- `JIGSAW_NAVOBJ=1`：按物体导航/瞄准（一致性更好，但当前取景不可用）。
